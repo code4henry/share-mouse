@@ -208,7 +208,7 @@ unsafe extern "system" fn mouse_hook_callback(
 ) -> LRESULT {
     if n_code >= 0 {
         if let Some(ptr) = HOOK_SENDER {
-            let tx = &**ptr;
+            let tx = &*ptr;
             let mi = &*(l_param.0 as *const MSLLHOOKSTRUCT);
             let event_type = w_param.0 as u32;
 
@@ -252,7 +252,7 @@ unsafe extern "system" fn keyboard_hook_callback(
 ) -> LRESULT {
     if n_code >= 0 {
         if let Some(ptr) = HOOK_SENDER {
-            let tx = &**ptr;
+            let tx = &*ptr;
             let kb = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
             let vk = kb.vk_code as u16;
             let event_type = w_param.0 as u32;
