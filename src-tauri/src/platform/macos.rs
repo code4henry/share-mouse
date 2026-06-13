@@ -45,15 +45,15 @@ impl PlatformInput for MacOSInput {
 
         let capturing = self.capturing.clone();
 
-        // Spawn a polling thread that reads mouse position at ~60 Hz.
-        // This is the simplest reliable approach. We'll upgrade to CGEventTap in v0.2.
+        // Spawn a polling thread that reads mouse position at ~250 Hz.
+        // Sends normalized absolute coordinates (0.0–1.0) so the engine can do
+        // edge detection and the peer can map to its own resolution.
         std::thread::spawn(move || {
-            let mut last_x: i32 = 0;
-            let mut last_y: i32 = 0;
-            let mut first = true;
+            let display = CGDisplay::main();
+            let mut last_x: f32 = -1.0;
+            let mut last_y: f32 = -1.0;
 
             while capturing.load(Ordering::SeqCst) {
-                // Get current mouse position
                 let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
                     Ok(s) => s,
                     Err(_) => {
@@ -69,30 +69,19 @@ impl PlatformInput for MacOSInput {
                     CGMouseButton::Left,
                 ) {
                     let loc = event.location();
-                    let x = loc.x as i32;
-                    let y = loc.y as i32;
+                    let w = display.pixels_wide().max(1) as f32;
+                    let h = display.pixels_high().max(1) as f32;
+                    let nx = (loc.x as f32 / w).clamp(0.0, 1.0);
+                    let ny = (loc.y as f32 / h).clamp(0.0, 1.0);
 
-                    if first {
-                        last_x = x;
-                        last_y = y;
-                        first = false;
-                    }
-
-                    if x != last_x || y != last_y {
-                        let dx = x - last_x;
-                        let dy = y - last_y;
-                        last_x = x;
-                        last_y = y;
-
-                        // Send both absolute and relative
-                        let _ = tx.try_send(InputEvent::MouseMove {
-                            dx: dx as i16,
-                            dy: dy as i16,
-                        });
+                    if (nx - last_x).abs() > 0.0005 || (ny - last_y).abs() > 0.0005 {
+                        last_x = nx;
+                        last_y = ny;
+                        let _ = tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
                     }
                 }
 
-                // ~60 Hz polling
+                // ~250 Hz polling for low-latency cursor tracking
                 std::thread::sleep(std::time::Duration::from_millis(4));
             }
         });

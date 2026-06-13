@@ -64,19 +64,28 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'ShareMouse ${{ github.ref_name }}'
           releaseBody: |
-            Cross-platform mouse & keyboard sharing app.
+            Cross-platform mouse & keyboard sharing app — share one mouse & keyboard between macOS and Windows.
 
-            ## Downloads
-            - **macOS**: `ShareMouse_aarch64.dmg` (Apple Silicon)
-            - **Windows**: `ShareMouse_0.1.0_x64-setup.exe` (installer)
+            ## 📦 Downloads
+            - **macOS** (Apple Silicon): `ShareMouse_*_aarch64.dmg`
+            - **Windows** (x64): `ShareMouse_*_x64-setup.exe` or `.msi`
 
-            ## Usage
+            ## 🚀 Usage
             1. Install on both Mac and Windows (same WiFi network)
             2. On the machine with the physical mouse/keyboard → click **Host**
-            3. On the other machine → enter Host IP → click **Connect**
+            3. On the other machine → enter Host's `IP:24800` → click **Connect**
             4. Move cursor to screen edge to switch machines!
 
-            > macOS users: grant Accessibility permission in System Settings → Privacy & Security → Accessibility
+            ## ⚠️ macOS — "文件已损坏" fix
+            The app is unsigned, so macOS shows "damaged". Fix in Terminal:
+            ```bash
+            xattr -cr ~/Downloads/ShareMouse_*.dmg
+            # drag to Applications, then:
+            xattr -cr /Applications/ShareMouse.app
+            ```
+            Then grant Accessibility: **系统设置 → 隐私与安全性 → 辅助功能 → ShareMouse**
+
+            **Windows** users: just run the `.exe` installer, no extra config needed.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

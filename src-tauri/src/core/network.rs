@@ -76,6 +76,11 @@ impl NetworkHub {
         (hub, rx)
     }
 
+    /// Get a fresh receiver for network messages (each consumer needs its own).
+    pub fn subscribe(&self) -> broadcast::Receiver<NetworkMessage> {
+        self.outbound_tx.subscribe()
+    }
+
     /// Start a TCP server and accept connections.
     pub async fn start_server(&self, port: u16) -> anyhow::Result<()> {
         let listener = TcpListener::bind(("0.0.0.0", port)).await?;

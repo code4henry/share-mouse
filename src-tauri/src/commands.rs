@@ -41,23 +41,30 @@ pub async fn get_role(state: State<'_, AppState>) -> Result<RoleInfo, String> {
         role: match role {
             Role::Host => "host".to_string(),
             Role::Client => "client".to_string(),
+            Role::None => "none".to_string(),
         },
     })
 }
 
-/// Switch to host mode.
+/// Switch to host mode: start the TCP server and begin capturing input.
 #[tauri::command]
 pub async fn set_role_host(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.set_role(Role::Host).await;
-    state.engine.start().await.map_err(|e| e.to_string())?;
+    // Start the TCP server in the background
+    let network = state.network.clone();
+    tokio::spawn(async move {
+        if let Err(e) = network.start_server(24800).await {
+            log::error!("Server error: {}", e);
+        }
+    });
+    // Start host capture + forwarding
+    state.engine.clone().start_host().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Switch to client mode.
+/// Switch to client mode: stop capturing, just receive and inject.
 #[tauri::command]
 pub async fn set_role_client(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.set_role(Role::Client).await;
-    state.engine.stop().await.map_err(|e| e.to_string())?;
+    state.engine.clone().start_client().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -95,25 +102,6 @@ pub async fn get_cursor_state(state: State<'_, AppState>) -> Result<CursorInfo, 
 pub async fn get_local_screen_size() -> Result<(u32, u32), String> {
     let platform = platform::create_platform_input();
     platform.get_screen_size().map_err(|e| e.to_string())
-}
-
-/// Start the TCP server (host mode).
-#[tauri::command]
-pub async fn start_server(
-    state: State<'_, AppState>,
-    port: Option<u16>,
-) -> Result<String, String> {
-    let port = port.unwrap_or(24800);
-    let network = state.network.clone();
-
-    // Spawn the server in the background
-    tokio::spawn(async move {
-        if let Err(e) = network.start_server(port).await {
-            log::error!("Server error: {}", e);
-        }
-    });
-
-    Ok(format!("Server starting on port {}", port))
 }
 
 /// Connect to a remote host (client mode).

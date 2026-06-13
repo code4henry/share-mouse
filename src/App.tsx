@@ -68,7 +68,6 @@ export default function App() {
   const becomeHost = async () => {
     setLoading(true);
     try {
-      await invoke('start_server', { port: serverPort });
       await invoke('set_role_host');
       setRole('host');
       addLog(`Started as Host (port ${serverPort})`);
