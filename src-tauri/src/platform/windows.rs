@@ -122,6 +122,12 @@ impl PlatformInput for WindowsInput {
                 self.warp_cursor((*x * w as f32) as i32, (*y * h as f32) as i32)?;
             }
 
+            InputEvent::MouseMoveNormalized { dx, dy } => {
+                let (w, h) = self.get_screen_size()?;
+                let (cx, cy) = self.get_cursor_pos()?;
+                self.warp_cursor(cx + (*dx * w as f32) as i32, cy + (*dy * h as f32) as i32)?;
+            }
+
             InputEvent::MouseDown { button } => {
                 let flags = match button {
                     MouseButton::Left => MOUSEEVENTF_LEFTDOWN,

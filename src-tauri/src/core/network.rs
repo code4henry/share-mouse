@@ -145,6 +145,8 @@ impl NetworkHub {
         let writes = self.peer_writes.lock().await;
         if let Some(tx) = writes.get(peer_id) {
             tx.send(event).await?;
+        } else {
+            log::warn!("send_to: peer {} not in write map", peer_id);
         }
         Ok(())
     }

@@ -34,6 +34,12 @@ pub trait PlatformInput: Send + Sync {
 
     /// Get the current cursor position.
     fn get_cursor_pos(&self) -> anyhow::Result<(i32, i32)>;
+
+    /// Whether the OS-level permission needed for capture/injection is granted
+    /// (Accessibility on macOS; always true on Windows).
+    fn check_permission(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import './index.css';
 
 // Types matching the Rust backend
@@ -28,6 +29,7 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [cursorInfo, setCursorInfo] = useState<CursorInfo>({ owner: 'local', peer_id: null });
   const [loading, setLoading] = useState(false);
+  const [permWarning, setPermWarning] = useState<string | null>(null);
 
   const addLog = useCallback((msg: string, level: LogEntry['level'] = 'info') => {
     setLogs(prev => [...prev.slice(-100), { time: timeNow(), msg, level }]);
@@ -46,6 +48,14 @@ export default function App() {
         setLocalScreen(size);
       } catch { /* ignore */ }
     })();
+
+    // Listen for macOS Accessibility permission warnings from the backend.
+    const unlisten = listen<{ message?: string }>('permission-warning', (e) => {
+      const msg = e.payload?.message ?? 'macOS Accessibility permission is required.';
+      setPermWarning(msg);
+      addLog('Accessibility permission MISSING — switching disabled', 'error');
+    });
+    return () => { unlisten.then(fn => fn()); };
   }, []);
 
   // Poll for peers and cursor state
@@ -71,10 +81,19 @@ export default function App() {
       await invoke('set_role_host');
       setRole('host');
       addLog(`Started as Host (port ${serverPort})`);
+      // Check permission and update banner.
+      try {
+        const ok = await invoke<boolean>('check_permission');
+        setPermWarning(ok ? null : 'macOS Accessibility permission is required for cursor switching.');
+      } catch { /* ignore */ }
     } catch (e) {
       addLog(`Failed to start host: ${e}`, 'error');
     }
     setLoading(false);
+  };
+
+  const openSettings = async () => {
+    try { await invoke('open_accessibility_settings'); } catch { /* ignore */ }
   };
 
   const becomeClient = async () => {
@@ -137,6 +156,25 @@ export default function App() {
           </span>
         </div>
       </header>
+
+      {permWarning && (
+        <div style={{
+          background: 'rgba(255, 107, 107, 0.12)',
+          borderBottom: '1px solid rgba(255, 107, 107, 0.4)',
+          padding: '10px 20px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+        }}>
+          <span style={{ color: 'var(--danger)', fontSize: 13 }}>
+            ⚠️ {permWarning} Grant it, then restart the app.
+          </span>
+          <button className="btn btn-primary" style={{ flexShrink: 0 }} onClick={openSettings}>
+            Open System Settings
+          </button>
+        </div>
+      )}
 
       <div className="main">
         {/* Sidebar */}

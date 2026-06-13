@@ -16,39 +16,50 @@ pub fn run() {
     let (network_hub, _net_rx) = NetworkHub::new();
     let network_hub = Arc::new(network_hub);
 
-    // Create the engine
+    // Create the engine. The local screen layout is seeded lazily
+    // (Engine::ensure_local_screen) on first capture / peer connect.
     let local_screen_id = format!("local-{}", uuid::Uuid::new_v4());
     let engine = Arc::new(Engine::new(platform_input, network_hub.clone(), local_screen_id));
-
-    // Seed a default single-screen layout so edge detection has a local screen entry.
-    {
-        let engine = engine.clone();
-        tauri::async_runtime::spawn(async move {
-            let size = engine.with_platform(|p| p.get_screen_size()).await;
-            if let Ok((w, h)) = size {
-                use core::screen::{ScreenInfo, ScreenRect};
-                let layout = core::screen::ScreenLayout {
-                    screens: vec![ScreenInfo {
-                        id: engine.local_id_for_setup(),
-                        name: "Local".to_string(),
-                        rect: ScreenRect { x: 0, y: 0, width: w, height: h },
-                        peer_id: None,
-                        width: w,
-                        height: h,
-                        dpi: 72,
-                    }],
-                };
-                engine.set_layout(layout).await;
-                log::info!("Default layout: local screen {}x{}", w, h);
-            }
-        });
-    }
 
     // Spawn the persistent network handler (consumes incoming events, injects them)
     engine.spawn_network_handler();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
+        .setup({
+            let engine = engine.clone();
+            let network = network_hub.clone();
+            move |_app| {
+                // Test/dev affordance: auto-start Host mode without UI.
+                if std::env::var("SHAREMOUSE_AUTO_HOST").is_ok() {
+                    log::info!("SHAREMOUSE_AUTO_HOST set — auto-starting host");
+                    let engine = engine.clone();
+                    let network = network.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let n = network.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = n.start_server(24800).await {
+                                log::error!("Server error: {}", e);
+                            }
+                        });
+                        if let Err(e) = engine.clone().start_host().await {
+                            log::error!("start_host error: {}", e);
+                        }
+                        let granted = engine.check_permission_simple().await;
+                        log::info!("Accessibility permission: {}", if granted { "GRANTED" } else { "MISSING" });
+                    });
+                }
+                Ok(())
+            }
+        })
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .build(),
+        )
         .manage(AppState {
             engine,
             network: network_hub,
@@ -64,6 +75,8 @@ pub fn run() {
             commands::connect_to_host,
             commands::get_peers,
             commands::stop_engine,
+            commands::check_permission,
+            commands::open_accessibility_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -43,6 +43,13 @@ pub enum InputEvent {
         y: f32,
     },
 
+    /// Relative mouse movement as a normalized fraction of the screen.
+    /// The receiver scales by its own screen size — correct across resolutions.
+    MouseMoveNormalized {
+        dx: f32,
+        dy: f32,
+    },
+
     /// Mouse button pressed
     MouseDown {
         button: MouseButton,

@@ -49,9 +49,11 @@ impl PlatformInput for MacOSInput {
         // Sends normalized absolute coordinates (0.0–1.0) so the engine can do
         // edge detection and the peer can map to its own resolution.
         std::thread::spawn(move || {
+            log::info!("capture thread started, polling at ~250Hz");
             let display = CGDisplay::main();
             let mut last_x: f32 = -1.0;
             let mut last_y: f32 = -1.0;
+            let mut tick: u32 = 0;
 
             while capturing.load(Ordering::SeqCst) {
                 let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
@@ -62,12 +64,10 @@ impl PlatformInput for MacOSInput {
                     }
                 };
 
-                if let Ok(event) = CGEvent::new_mouse_event(
-                    source,
-                    CGEventType::MouseMoved,
-                    CGPoint::new(0.0, 0.0),
-                    CGMouseButton::Left,
-                ) {
+                // CGEvent::new() creates a null event whose location is the CURRENT
+                // cursor position — the correct way to read it. (new_mouse_event with
+                // a (0,0) position would always read (0,0).)
+                if let Ok(event) = CGEvent::new(source) {
                     let loc = event.location();
                     let w = display.pixels_wide().max(1) as f32;
                     let h = display.pixels_high().max(1) as f32;
@@ -78,6 +78,12 @@ impl PlatformInput for MacOSInput {
                         last_x = nx;
                         last_y = ny;
                         let _ = tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
+                    }
+
+                    // Heartbeat so we can confirm the capture loop is alive + reading positions.
+                    tick = tick.wrapping_add(1);
+                    if tick % 500 == 0 {
+                        log::debug!("capture: nx={:.4} ny={:.4}", nx, ny);
                     }
                 }
 
@@ -104,6 +110,12 @@ impl PlatformInput for MacOSInput {
             InputEvent::MouseMoveAbsolute { x, y } => {
                 let (w, h) = self.get_screen_size()?;
                 self.warp_cursor((*x * w as f32) as i32, (*y * h as f32) as i32)?;
+            }
+
+            InputEvent::MouseMoveNormalized { dx, dy } => {
+                let (w, h) = self.get_screen_size()?;
+                let (cx, cy) = self.get_cursor_pos()?;
+                self.warp_cursor(cx + (*dx * w as f32) as i32, cy + (*dy * h as f32) as i32)?;
             }
 
             InputEvent::MouseDown { button } => {
@@ -191,10 +203,15 @@ impl PlatformInput for MacOSInput {
     }
 
     fn warp_cursor(&self, x: i32, y: i32) -> anyhow::Result<()> {
+        log::debug!("warp_cursor ({},{})", x, y);
         unsafe {
             CGWarpMouseCursorPosition(CGPoint::new(x as f64, y as f64));
         }
         Ok(())
+    }
+
+    fn check_permission(&self) -> bool {
+        check_accessibility_trusted()
     }
 
     fn get_screen_size(&self) -> anyhow::Result<(u32, u32)> {
@@ -204,13 +221,8 @@ impl PlatformInput for MacOSInput {
 
     fn get_cursor_pos(&self) -> anyhow::Result<(i32, i32)> {
         let source = default_source();
-        let event = CGEvent::new_mouse_event(
-            source,
-            CGEventType::MouseMoved,
-            CGPoint::new(0.0, 0.0),
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("get cursor pos"))?;
+        let event = CGEvent::new(source)
+            .map_err(|_| anyhow::anyhow!("get cursor pos"))?;
         let loc = event.location();
         Ok((loc.x as i32, loc.y as i32))
     }
@@ -256,4 +268,10 @@ fn mouse_button_to_cg(button: MouseButton) -> CGMouseButton {
 
 extern "C" {
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint);
+    fn AXIsProcessTrusted() -> u8;
+}
+
+/// Check whether this process has Accessibility permission.
+pub fn check_accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
 }

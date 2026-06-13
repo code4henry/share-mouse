@@ -56,8 +56,8 @@ pub struct Engine {
     local_screen_id: String,
 }
 
-/// Pixels from a screen edge that trigger a transition.
-const EDGE_ZONE: f32 = 0.004; // normalized
+/// Normalized distance from the client's host-facing edge that returns the cursor.
+const EDGE_ZONE: f32 = 0.01;
 /// When the host cursor (hidden) gets this close to any edge while controlling
 /// a remote screen, we warp it back to center ("infinite mouse").
 const WARP_MARGIN: f32 = 0.15;
@@ -118,23 +118,25 @@ impl Engine {
 
     /// Add a remote screen to the right of the local screen for a given peer.
     async fn add_remote_screen(&self, peer_id: PeerId) {
+        self.ensure_local_screen().await;
+        let pid_str = peer_id.to_string();
         let mut layout = self.layout.lock().await;
         // Don't add twice.
-        if layout.screens.iter().any(|s| s.peer_id.as_deref() == Some(peer_id.to_string().as_str())) {
+        if layout.screens.iter().any(|s| s.peer_id.as_deref() == Some(pid_str.as_str())) {
             return;
         }
         // Find the local screen to position relative to it.
         if let Some(local) = layout.screens.iter().find(|s| s.peer_id.is_none()).cloned() {
             let remote = ScreenInfo {
                 id: format!("remote-{}", peer_id),
-                name: format!("Remote {}", &peer_id.to_string()[..8]),
+                name: format!("Remote {}", &pid_str[..8]),
                 rect: ScreenRect {
                     x: local.rect.right(),
                     y: local.rect.y,
                     width: local.rect.width,
                     height: local.rect.height,
                 },
-                peer_id: Some(peer_id.to_string()),
+                peer_id: Some(pid_str),
                 width: local.rect.width,
                 height: local.rect.height,
                 dpi: local.dpi,
@@ -142,6 +144,41 @@ impl Engine {
             layout.screens.push(remote);
             log::info!("Added remote screen for peer {} (to the right)", peer_id);
         }
+    }
+
+    /// Ensure the local screen exists in the layout (race-free, idempotent).
+    async fn ensure_local_screen(&self) {
+        {
+            let layout = self.layout.lock().await;
+            if layout.screens.iter().any(|s| s.id == self.local_screen_id) {
+                return;
+            }
+        }
+        let size = {
+            let p = self.platform.lock().await;
+            p.get_screen_size()
+        };
+        if let Ok((w, h)) = size {
+            let mut layout = self.layout.lock().await;
+            if !layout.screens.iter().any(|s| s.id == self.local_screen_id) {
+                layout.screens.push(ScreenInfo {
+                    id: self.local_screen_id.clone(),
+                    name: "Local".to_string(),
+                    rect: ScreenRect { x: 0, y: 0, width: w, height: h },
+                    peer_id: None,
+                    width: w,
+                    height: h,
+                    dpi: 72,
+                });
+                log::info!("Lazy-seeded local screen {}x{} (id={})", w, h, self.local_screen_id);
+            }
+        }
+    }
+
+    /// Whether the OS permission needed for capture/injection is granted.
+    pub async fn check_permission_simple(&self) -> bool {
+        let p = self.platform.lock().await;
+        p.check_permission()
     }
 
     /// Remove a peer's screen from the layout.
@@ -222,7 +259,7 @@ impl Engine {
                         // Cursor returned to the host-facing edge — give it back.
                         let peer = if let CursorOwner::Remote(pid) = owner { Some(pid) } else { None };
                         if let Some(pid) = peer {
-                            log::info!("Client: cursor at return edge, sending CursorLeave");
+                            log::info!("client_monitor: nx={:.4}, sending CursorLeave to {}", nx, pid);
                             let _ = self.network.send_to(&pid, InputEvent::CursorLeave).await;
                             self.state.lock().await.cursor_owner = CursorOwner::Local;
                             let p = self.platform.lock().await;
@@ -287,6 +324,7 @@ impl Engine {
         if role != Role::Host {
             return;
         }
+        self.ensure_local_screen().await;
 
         let cursor_owner = self.state.lock().await.cursor_owner;
 
@@ -306,20 +344,26 @@ impl Engine {
                     if let Some((edge, neighbor)) =
                         layout.detect_edge(&self.local_screen_id, px, py)
                     {
-                        if let Some(peer_id_str) = &neighbor.peer_id {
-                            if let Ok(peer_id) = uuid::Uuid::parse_str(peer_id_str) {
-                                // Compute entry point on the neighbor (normalized).
-                                let (nx, ny) = layout.map_cursor_to_neighbor(
-                                    &self.local_screen_id,
-                                    edge,
-                                    px,
-                                    py,
-                                    neighbor,
-                                );
-                                drop(layout);
+                        let neighbor_peer = neighbor.peer_id.clone();
+                        let (nx, ny) = layout.map_cursor_to_neighbor(
+                            &self.local_screen_id,
+                            edge,
+                            px,
+                            py,
+                            neighbor,
+                        );
+                        drop(layout);
 
+                        log::info!(
+                            "EDGE HIT: edge={:?} neighbor_peer={:?} entry=({:.3},{:.3})",
+                            edge, neighbor_peer, nx, ny
+                        );
+
+                        if let Some(peer_id_str) = neighbor_peer {
+                            if let Ok(peer_id) = uuid::Uuid::parse_str(&peer_id_str) {
                                 // Tell the peer to take the cursor.
                                 let _ = self.network.send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny }).await;
+                                log::info!("-> CursorEnter to peer {} at ({:.3},{:.3})", peer_id, nx, ny);
 
                                 // Hide our cursor and warp to center (so we can capture deltas freely).
                                 {
@@ -332,7 +376,7 @@ impl Engine {
                                     s.cursor_owner = CursorOwner::Remote(peer_id);
                                     s.remote_origin = Some((0.5, 0.5)); // we warped to center
                                 }
-                                log::info!("Cursor handed off to peer {}", peer_id);
+                                log::info!("host: cursor hidden + warped, owner=Remote({})", peer_id);
                                 return;
                             }
                         }
@@ -344,7 +388,7 @@ impl Engine {
                 // Cursor logically on the remote screen. Forward input there.
                 match event {
                     InputEvent::MouseMoveAbsolute { x, y } => {
-                        // Compute delta from last origin, forward as relative move.
+                        // Compute normalized delta from last origin.
                         let (dx_n, dy_n, new_origin, need_warp) = {
                             let s = self.state.lock().await;
                             let origin = s.remote_origin.unwrap_or((0.5, 0.5));
@@ -355,22 +399,25 @@ impl Engine {
                             (dx, dy, (*x, *y), near_edge)
                         };
 
-                        // Scale normalized delta to pixels.
-                        let (w, h) = {
-                            let p = self.platform.lock().await;
-                            p.get_screen_size().unwrap_or((1920, 1080))
-                        };
-                        let dx_px = (dx_n * w as f32) as i16;
-                        let dy_px = (dy_n * h as f32) as i16;
-                        if dx_px != 0 || dy_px != 0 {
-                            let _ = self.network.send_to(&peer_id, InputEvent::MouseMove { dx: dx_px, dy: dy_px }).await;
+                        // Forward as normalized delta — client scales by its own size.
+                        if dx_n.abs() > 0.0002 || dy_n.abs() > 0.0002 {
+                            log::debug!("-> MouseMoveNormalized dx={:.4} dy={:.4}", dx_n, dy_n);
+                            let _ = self.network.send_to(
+                                &peer_id,
+                                InputEvent::MouseMoveNormalized { dx: dx_n, dy: dy_n },
+                            ).await;
                         }
 
                         // Infinite-mouse: if near a local edge, warp back to center.
                         if need_warp {
+                            let (w, h) = {
+                                let p = self.platform.lock().await;
+                                p.get_screen_size().unwrap_or((1920, 1080))
+                            };
                             let p = self.platform.lock().await;
                             p.warp_cursor((w / 2) as i32, (h / 2) as i32).ok();
                             drop(p);
+                            log::debug!("infinite-mouse warp to center");
                             self.state.lock().await.remote_origin = Some((0.5, 0.5));
                         } else {
                             self.state.lock().await.remote_origin = Some(new_origin);
@@ -397,7 +444,7 @@ impl Engine {
                 let p = self.platform.lock().await;
                 p.show_cursor().ok();
                 p.inject_event(&InputEvent::MouseMoveAbsolute { x: *x, y: *y }).ok();
-                log::info!("Cursor entered local screen from peer");
+                log::info!("<- CursorEnter from {} at ({:.3},{:.3})", from, x, y);
             }
             InputEvent::CursorLeave => {
                 // Client returned the cursor to us (host). Reclaim it:
@@ -412,12 +459,13 @@ impl Engine {
                 if let Ok((w, h)) = p.get_screen_size() {
                     p.warp_cursor((w - 10) as i32, (h / 2) as i32).ok();
                 }
-                log::info!("Cursor returned to local screen");
+                log::info!("<- CursorLeave from {}, owner=Local", from);
             }
-            _ => {
+            other => {
                 // Regular input event — inject if a remote owns the cursor.
                 let owner = self.state.lock().await.cursor_owner;
                 if let CursorOwner::Remote(_) = owner {
+                    log::debug!("<- injected {:?} from {}", other, from);
                     let p = self.platform.lock().await;
                     p.inject_event(event).ok();
                 }

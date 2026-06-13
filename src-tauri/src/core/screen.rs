@@ -127,7 +127,7 @@ impl ScreenLayout {
         let screen = self.screens.iter().find(|s| s.id == local_screen_id)?;
         let rect = &screen.rect;
 
-        const EDGE_ZONE: i32 = 3; // pixels from edge to trigger transition
+        const EDGE_ZONE: i32 = 6; // pixels from edge to trigger transition
 
         // Check each edge
         let edges = [
@@ -150,40 +150,118 @@ impl ScreenLayout {
 
     /// Map cursor position from one screen's edge to the neighbor's corresponding position.
     /// Returns normalized (0.0–1.0) coordinates on the target screen.
+    /// Normalization uses the SOURCE screen's dimensions (cursor coords are in source space).
     pub fn map_cursor_to_neighbor(
         &self,
-        _source_id: &str,
+        source_id: &str,
         edge: Edge,
         cursor_x: i32,
         cursor_y: i32,
-        neighbor: &ScreenInfo,
+        _neighbor: &ScreenInfo,
     ) -> (f32, f32) {
-        let nr = &neighbor.rect;
+        let source = match self.screens.iter().find(|s| s.id == source_id) {
+            Some(s) => s,
+            None => return (0.5, 0.5), // fallback
+        };
+        let sr = &source.rect;
 
         match edge {
             Edge::Right => {
-                // Enter from the left of neighbor
-                let y_norm = cursor_y as f32 / nr.height as f32;
-                (0.0, y_norm.clamp(0.0, 1.0))
+                // Enter neighbor from its left edge; Y tracks source Y.
+                let y_norm = ((cursor_y - sr.y) as f32 / sr.height as f32).clamp(0.0, 1.0);
+                (0.0, y_norm)
             }
             Edge::Left => {
-                // Enter from the right of neighbor
-                let y_norm = cursor_y as f32 / nr.height as f32;
-                (1.0, y_norm.clamp(0.0, 1.0))
+                let y_norm = ((cursor_y - sr.y) as f32 / sr.height as f32).clamp(0.0, 1.0);
+                (1.0, y_norm)
             }
             Edge::Bottom => {
-                // Enter from the top of neighbor
-                let x_norm = cursor_x as f32 / nr.width as f32;
-                (x_norm.clamp(0.0, 1.0), 0.0)
+                let x_norm = ((cursor_x - sr.x) as f32 / sr.width as f32).clamp(0.0, 1.0);
+                (x_norm, 0.0)
             }
             Edge::Top => {
-                // Enter from the bottom of neighbor
-                let x_norm = cursor_x as f32 / nr.width as f32;
-                (x_norm.clamp(0.0, 1.0), 1.0)
+                let x_norm = ((cursor_x - sr.x) as f32 / sr.width as f32).clamp(0.0, 1.0);
+                (x_norm, 1.0)
             }
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_layout() -> ScreenLayout {
+        ScreenLayout {
+            screens: vec![
+                ScreenInfo {
+                    id: "local".to_string(),
+                    name: "Local".to_string(),
+                    rect: ScreenRect { x: 0, y: 0, width: 2560, height: 1440 },
+                    peer_id: None,
+                    width: 2560,
+                    height: 1440,
+                    dpi: 72,
+                },
+                ScreenInfo {
+                    id: "remote".to_string(),
+                    name: "Remote".to_string(),
+                    rect: ScreenRect { x: 2560, y: 0, width: 1920, height: 1080 },
+                    peer_id: Some("abc".to_string()),
+                    width: 1920,
+                    height: 1080,
+                    dpi: 72,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn detect_right_edge_finds_neighbor() {
+        let l = local_layout();
+        assert!(l.detect_edge("local", 2555, 720).is_some()); // within 6px zone
+        assert!(l.detect_edge("local", 100, 720).is_none()); // mid-screen
+    }
+
+    #[test]
+    fn detect_left_edge_no_neighbor() {
+        let l = local_layout();
+        assert!(l.detect_edge("local", 1, 720).is_none()); // left edge, no neighbor
+    }
+
+    #[test]
+    fn find_neighbor_right_only() {
+        let l = local_layout();
+        assert!(l.find_neighbor("local", Edge::Right).is_some());
+        assert!(l.find_neighbor("local", Edge::Left).is_none());
+    }
+
+    #[test]
+    fn map_right_edge_same_res() {
+        let mut l = local_layout();
+        // make remote same size as local
+        l.screens[1].rect = ScreenRect { x: 2560, y: 0, width: 2560, height: 1440 };
+        let n = l.find_neighbor("local", Edge::Right).unwrap().clone();
+        let (x, y) = l.map_cursor_to_neighbor("local", Edge::Right, 2559, 720, &n);
+        assert_eq!(x, 0.0);
+        assert!((y - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn map_right_edge_diff_res() {
+        // local 2560x1440, remote 1920x1080 — cursor_y is in SOURCE space.
+        let l = local_layout();
+        let n = l.find_neighbor("local", Edge::Right).unwrap().clone();
+        let (x, y) = l.map_cursor_to_neighbor("local", Edge::Right, 2559, 720, &n);
+        assert_eq!(x, 0.0);
+        assert!((y - 0.5).abs() < 0.01, "mid-height should be 0.5, got {}", y);
+        let (_, y0) = l.map_cursor_to_neighbor("local", Edge::Right, 2559, 0, &n);
+        assert!(y0.abs() < 0.01);
+        let (_, yb) = l.map_cursor_to_neighbor("local", Edge::Right, 2559, 1439, &n);
+        assert!((yb - 1.0).abs() < 0.01);
+    }
+}
+
 
 /// Check if two ranges overlap (for screen adjacency detection).
 fn ranges_overlap(start1: i32, len1: u32, start2: i32, len2: u32) -> bool {

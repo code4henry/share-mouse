@@ -1,7 +1,7 @@
 /// Tauri IPC commands — bridge between the React frontend and the Rust backend.
 
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::core::{Engine, Role, CursorOwner, screen::ScreenLayout};
 use crate::core::network::NetworkHub;
@@ -48,7 +48,10 @@ pub async fn get_role(state: State<'_, AppState>) -> Result<RoleInfo, String> {
 
 /// Switch to host mode: start the TCP server and begin capturing input.
 #[tauri::command]
-pub async fn set_role_host(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn set_role_host(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     // Start the TCP server in the background
     let network = state.network.clone();
     tokio::spawn(async move {
@@ -58,6 +61,19 @@ pub async fn set_role_host(state: State<'_, AppState>) -> Result<(), String> {
     });
     // Start host capture + forwarding
     state.engine.clone().start_host().await.map_err(|e| e.to_string())?;
+
+    // Check Accessibility permission and surface status to the UI.
+    let granted = state.engine.check_permission_simple().await;
+    if granted {
+        log::info!("Accessibility permission: GRANTED");
+        let _ = app.emit("permission-status", serde_json::json!({ "granted": true }));
+    } else {
+        log::error!("ACCESSIBILITY PERMISSION MISSING — cursor switching will NOT work");
+        let _ = app.emit("permission-warning", serde_json::json!({
+            "type": "accessibility",
+            "message": "macOS Accessibility permission is required for cursor switching."
+        }));
+    }
     Ok(())
 }
 
@@ -65,6 +81,22 @@ pub async fn set_role_host(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn set_role_client(state: State<'_, AppState>) -> Result<(), String> {
     state.engine.clone().start_client().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Check whether the OS permission needed for capture/injection is granted.
+#[tauri::command]
+pub async fn check_permission(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.engine.check_permission_simple().await)
+}
+
+/// Open the macOS Accessibility privacy settings pane.
+#[tauri::command]
+pub async fn open_accessibility_settings() -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
