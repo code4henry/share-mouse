@@ -3,6 +3,7 @@ mod core;
 mod platform;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use commands::AppState;
@@ -23,6 +24,9 @@ pub fn run() {
     let local_screen_id = format!("local-{}", uuid::Uuid::new_v4());
     let engine = Arc::new(Engine::new(platform_input, network_hub.clone(), local_screen_id));
 
+    // ── Shared HWND for the background minimise monitor ────
+    let hwnd_holder: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+
     // ── Dedicated background thread ──────────────────────
     // tauri::async_runtime may throttle when the window is minimized.
     // Run all keyboard/mouse forwarding on an independent thread+tokio
@@ -31,6 +35,7 @@ pub fn run() {
     let bg_network = network_hub.clone();
     let auto_host = std::env::var("SHAREMOUSE_AUTO_HOST").ok();
     let auto_client = std::env::var("SHAREMOUSE_AUTO_CLIENT").ok();
+    let bg_hwnd = hwnd_holder.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -71,16 +76,31 @@ pub fn run() {
                 }
             }
 
+            // ── Minimise → hide monitor ─────────────────
+            // Windows throttles SendInput/SetCursorPos for minimised
+            // windows.  Poll IsIconic() on the main window HWND and
+            // convert minimise to hide automatically.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let hwnd = *bg_hwnd.lock().unwrap();
+                    if let Some(h) = hwnd {
+                        if h != 0 && is_iconic(h) {
+                            restore_and_hide(h);
+                            log::info!("minimise → hide (tray) to keep injection alive");
+                        }
+                    }
+                }
+            });
+
             // Hold the runtime open (idle, waiting on spawned tasks).
             std::future::pending::<()>().await;
         });
     });
 
     tauri::Builder::default()
-        .setup(|app| {
-            // System tray: keep the process alive when the window is hidden.
-            // Windows throttles SendInput/SetCursorPos for minimized windows;
-            // hiding to tray instead prevents that throttling.
+        .setup(move |app| {
+            // System tray — keep process alive when hidden.
             let _tray = TrayIconBuilder::with_id("share-mouse")
                 .tooltip("ShareMouse")
                 .on_tray_icon_event(|tray, event| {
@@ -90,7 +110,6 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        // Show & focus the main window on tray click.
                         if let Some(window) = tray.app_handle().get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
@@ -98,6 +117,16 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Share the main-window HWND with the background thread so it
+            // can detect minimise and turn it into a tray hide.
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
+                if let Ok(hwnd) = window.hwnd() {
+                    *hwnd_holder.lock().unwrap() = Some(hwnd.0 as isize);
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -142,3 +171,28 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ── Windows minimise → tray helpers ──────────────────────
+
+#[cfg(target_os = "windows")]
+fn is_iconic(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+    use windows::Win32::Foundation::HWND;
+    unsafe { IsIconic(HWND(hwnd as *mut _)).as_bool() }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_and_hide(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE, SW_HIDE};
+    use windows::Win32::Foundation::HWND;
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_RESTORE);
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_iconic(_hwnd: isize) -> bool { false }
+
+#[cfg(not(target_os = "windows"))]
+fn restore_and_hide(_hwnd: isize) {}

@@ -469,16 +469,16 @@ fn mac_keycode_to_win_vk(kc: u16) -> u16 {
         0x33 => 0x08, // Backspace
         0x34 => 0x0D, // Enter (powerbook)
         0x35 => 0x1B, // Escape
-        // ── Modifiers ──
-        0x36 => 0x5D, // Right Cmd  → VK_APPS    (context menu)
-        0x37 => 0x5C, // Left Cmd   → VK_LWIN
+        // ── Modifiers ──   (Mac Cmd → Win Ctrl, Mac Ctrl → Win Win-key)
+        0x36 => 0xA3, // Right Cmd  → VK_RCONTROL
+        0x37 => 0xA2, // Left Cmd   → VK_LCONTROL
         0x38 => 0xA0, // Left Shift
         0x39 => 0x14, // Caps Lock
         0x3A => 0xA4, // Left Option  → VK_LMENU
-        0x3B => 0xA2, // Left Control
+        0x3B => 0x5C, // Left Control → VK_LWIN
         0x3C => 0xA1, // Right Shift
         0x3D => 0xA5, // Right Option → VK_RMENU
-        0x3E => 0xA3, // Right Control
+        0x3E => 0x5D, // Right Control → VK_RWIN
         0x3F => 0xAD, // fn (global) → VK_VOLUME_MUTE (soft fallback)
         // ── Arrows ──
         0x7B => 0x25, // Left
