@@ -143,8 +143,10 @@ impl PlatformInput for WindowsInput {
             }
 
             InputEvent::MouseMoveNormalized { dx, dy } => {
-                // Virtual cursor → SetCursorPos, bypasses acceleration AND
-                // avoids stale GetCursorPos reads during mouse-drag state.
+                // SendInput MOVEMENT path gives DWM-synced cursor rendering
+                // (visibly smoother than SetCursorPos).  Delta is computed
+                // from the virtual tracker — NO GetCursorPos, NO drift
+                // accumulation even with Windows pointer-speed scaling.
                 let (w, h) = self.get_screen_size()?;
                 let dx_f = *dx * w as f32;
                 let dy_f = *dy * h as f32;
@@ -154,7 +156,13 @@ impl PlatformInput for WindowsInput {
                 let new_y = (old_y + dy_f).clamp(0.0, (h - 1) as f32);
                 self.vx.store(f32::to_bits(new_x), Ordering::SeqCst);
                 self.vy.store(f32::to_bits(new_y), Ordering::SeqCst);
-                self.warp_cursor(new_x as i32, new_y as i32)?;
+                // Inject relative delta for DWM-smooth movement.
+                send_mouse_event(
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                    (new_x - old_x) as i32,
+                    (new_y - old_y) as i32,
+                    0,
+                )?;
             }
 
             InputEvent::MouseDown { button } => {
