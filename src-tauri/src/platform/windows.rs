@@ -5,7 +5,7 @@
 /// Cursor: SetCursorPos(), ShowCursor().
 /// Screen: GetSystemMetrics(), GetCursorPos().
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -39,12 +39,17 @@ use super::PlatformInput;
 
 pub struct WindowsInput {
     capturing: Arc<AtomicBool>,
+    /// Virtual cursor position (f32 bits) — avoids stale GetCursorPos during drag.
+    vx: AtomicU32,
+    vy: AtomicU32,
 }
 
 impl WindowsInput {
     pub fn new() -> Self {
         Self {
             capturing: Arc::new(AtomicBool::new(false)),
+            vx: AtomicU32::new(0),
+            vy: AtomicU32::new(0),
         }
     }
 }
@@ -138,14 +143,18 @@ impl PlatformInput for WindowsInput {
             }
 
             InputEvent::MouseMoveNormalized { dx, dy } => {
-                // SetCursorPos bypasses Windows mouse acceleration — no drift.
-                // Normalized deltas from the Mac Host are smooth f32 values,
-                // so the jump-per-packet is small and regular.
+                // Virtual cursor → SetCursorPos, bypasses acceleration AND
+                // avoids stale GetCursorPos reads during mouse-drag state.
                 let (w, h) = self.get_screen_size()?;
-                let (cx, cy) = self.get_cursor_pos()?;
-                let px = (*dx * w as f32) as i32;
-                let py = (*dy * h as f32) as i32;
-                self.warp_cursor(cx + px, cy + py)?;
+                let dx_f = *dx * w as f32;
+                let dy_f = *dy * h as f32;
+                let old_x = f32::from_bits(self.vx.load(Ordering::SeqCst));
+                let old_y = f32::from_bits(self.vy.load(Ordering::SeqCst));
+                let new_x = (old_x + dx_f).clamp(0.0, (w - 1) as f32);
+                let new_y = (old_y + dy_f).clamp(0.0, (h - 1) as f32);
+                self.vx.store(f32::to_bits(new_x), Ordering::SeqCst);
+                self.vy.store(f32::to_bits(new_y), Ordering::SeqCst);
+                self.warp_cursor(new_x as i32, new_y as i32)?;
             }
 
             InputEvent::MouseDown { button } => {
@@ -185,7 +194,12 @@ impl PlatformInput for WindowsInput {
 
             InputEvent::CursorEnter { x, y } => {
                 let (w, h) = self.get_screen_size()?;
-                self.warp_cursor((*x * w as f32) as i32, (*y * h as f32) as i32)?;
+                let px = (*x * w as f32) as i32;
+                let py = (*y * h as f32) as i32;
+                self.warp_cursor(px, py)?;
+                // Seed virtual tracker from the warped position.
+                self.vx.store(f32::to_bits(px as f32), Ordering::SeqCst);
+                self.vy.store(f32::to_bits(py as f32), Ordering::SeqCst);
             }
 
             _ => {}
