@@ -3063,7 +3063,6 @@ dependencies = [
  "block",
  "core-foundation",
  "core-graphics 0.24.0",
- "fern",
  "log",
  "objc",
  "serde",

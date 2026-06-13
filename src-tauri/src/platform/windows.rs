@@ -138,18 +138,14 @@ impl PlatformInput for WindowsInput {
             }
 
             InputEvent::MouseMoveNormalized { dx, dy } => {
-                // Scale the normalized delta to our screen size and inject
-                // via SendInput for smooth, display-synced movement (fixes the
-                // main stutter when Mac → Windows host→client path is active).
+                // SetCursorPos bypasses Windows mouse acceleration — no drift.
+                // Normalized deltas from the Mac Host are smooth f32 values,
+                // so the jump-per-packet is small and regular.
                 let (w, h) = self.get_screen_size()?;
+                let (cx, cy) = self.get_cursor_pos()?;
                 let px = (*dx * w as f32) as i32;
                 let py = (*dy * h as f32) as i32;
-                send_mouse_event(
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
-                    px,
-                    py,
-                    0,
-                )?;
+                self.warp_cursor(cx + px, cy + py)?;
             }
 
             InputEvent::MouseDown { button } => {
