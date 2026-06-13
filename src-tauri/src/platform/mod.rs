@@ -40,6 +40,11 @@ pub trait PlatformInput: Send + Sync {
     fn check_permission(&self) -> bool {
         true
     }
+
+    /// Tell the capture layer whether events should be dropped from the host
+    /// (because the cursor is logically on a remote screen).  Only meaningful
+    /// on macOS with CGEventTap; a no-op on other platforms.
+    fn set_is_remote(&self, _remote: bool) {}
 }
 
 #[cfg(target_os = "macos")]

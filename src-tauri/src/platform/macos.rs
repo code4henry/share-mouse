@@ -1,7 +1,9 @@
 /// macOS input capture and injection using CoreGraphics CGEvent API.
 ///
-/// v0.1: Uses a polling-based approach for mouse capture and a proper CGEventTap
-/// via the core_graphics crate's built-in tap support.
+/// v0.6: Uses an active CGEventTap at the HID level to intercept all mouse,
+/// keyboard, click, and scroll events at native rate. When the cursor is
+/// logically on a remote screen, the tap drops events from the host OS
+/// (returning None) and forwards them to the engine → client instead.
 ///
 /// Injection: Uses CGEvent::new_mouse_event / CGEvent::new_keyboard_event + CGEventPost.
 /// Cursor: Uses CGWarpMouseCursorPosition, CGDisplayHideCursor/ShowCursor.
@@ -9,10 +11,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation,
-    CGEventType, CGMouseButton, EventField,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CGMouseButton, EventField, CGEventTap,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -26,69 +29,176 @@ fn default_source() -> CGEventSource {
         .expect("create CGEventSource")
 }
 
+// ── CGEventTap state ────────────────────────────────────
+
+/// Shared state between the tap callback (called on the CFRunLoop thread)
+/// and the engine (called on the async runtime).  The tap reads `is_remote`
+/// to decide whether to drop events from the host OS.
+struct TapState {
+    is_remote: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<InputEvent>,
+    screen_w: f32,
+    screen_h: f32,
+}
+
+/// Whether the event type carries cursor position (for edge-detection feed).
+fn is_mouse_or_click(t: CGEventType) -> bool {
+    use CGEventType::*;
+    matches!(t,
+        MouseMoved | LeftMouseDown | LeftMouseUp
+        | RightMouseDown | RightMouseUp
+        | OtherMouseDown | OtherMouseUp
+        | LeftMouseDragged | RightMouseDragged | OtherMouseDragged
+    )
+}
+
+/// Convert a tap CGEventType + event into a MouseButton.
+fn button_from_tap(et: CGEventType, _event: &CGEvent) -> MouseButton {
+    use CGEventType::*;
+    match et {
+        LeftMouseDown | LeftMouseUp | LeftMouseDragged => MouseButton::Left,
+        RightMouseDown | RightMouseUp | RightMouseDragged => MouseButton::Right,
+        _ => MouseButton::Middle, // OtherMouse* — could read MOUSE_EVENT_BUTTON_NUMBER for precision
+    }
+}
+
+/// The tap callback — runs on the CFRunLoop thread, must not block.
+fn tap_callback(
+    _proxy: *const std::ffi::c_void,
+    event_type: CGEventType,
+    event: &CGEvent,
+    state: &TapState,
+) -> Option<CGEvent> {
+    let remote = state.is_remote.load(Ordering::Relaxed);
+
+    // Always feed cursor position for edge detection (not clicks though — edge
+    // detection only cares about MouseMoved / Drag absolute position).
+    if is_mouse_or_click(event_type) {
+        let loc = event.location();
+        let nx = (loc.x as f32 / state.screen_w).clamp(0.0, 1.0);
+        let ny = (loc.y as f32 / state.screen_h).clamp(0.0, 1.0);
+        let _ = state.tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
+    }
+
+    if remote {
+        // Drop from host OS. Forward to engine → client.
+        match event_type {
+            CGEventType::MouseMoved => {
+                let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i16;
+                let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i16;
+                let _ = state.tx.try_send(InputEvent::MouseMove { dx, dy });
+            }
+            CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+                let btn = button_from_tap(event_type, event);
+                let _ = state.tx.try_send(InputEvent::MouseDown { button: btn });
+            }
+            CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp => {
+                let btn = button_from_tap(event_type, event);
+                let _ = state.tx.try_send(InputEvent::MouseUp { button: btn });
+            }
+            CGEventType::ScrollWheel => {
+                let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+                let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+                let _ = state.tx.try_send(InputEvent::Scroll { dx: dx as i16, dy: dy as i16 });
+            }
+            CGEventType::KeyDown => {
+                let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                let mods = extract_modifiers(event);
+                let _ = state.tx.try_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods });
+            }
+            CGEventType::KeyUp => {
+                let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                let mods = extract_modifiers(event);
+                let _ = state.tx.try_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods });
+            }
+            CGEventType::FlagsChanged => {
+                // Modifier-only state change — forward as both down+up to keep things simple.
+                // The modifiers are extracted from the event flags.
+            }
+            _ => {}
+        }
+        return None; // drop from host OS when remote
+    }
+
+    // Local: pass the event through so macOS processes it normally.
+    // CGEvent's Clone does CFRetain — safe to return a retained copy.
+    Some(event.clone())
+}
+
 pub struct MacOSInput {
-    capturing: Arc<AtomicBool>,
+    /// Whether the engine has told the tap the cursor is on a remote screen.
+    pub tap_is_remote: Arc<AtomicBool>,
 }
 
 impl MacOSInput {
     pub fn new() -> Self {
         Self {
-            capturing: Arc::new(AtomicBool::new(false)),
+            tap_is_remote: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl PlatformInput for MacOSInput {
     fn start_capture(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<InputEvent>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(512);
-        self.capturing.store(true, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
 
-        let capturing = self.capturing.clone();
+        let is_remote = self.tap_is_remote.clone();
+        let display = CGDisplay::main();
+        let screen_w = display.pixels_wide().max(1) as f32;
+        let screen_h = display.pixels_high().max(1) as f32;
+        let event_types = vec![
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDown,  CGEventType::LeftMouseUp,
+            CGEventType::RightMouseDown, CGEventType::RightMouseUp,
+            CGEventType::OtherMouseDown, CGEventType::OtherMouseUp,
+            CGEventType::LeftMouseDragged, CGEventType::RightMouseDragged,
+            CGEventType::OtherMouseDragged,
+            CGEventType::ScrollWheel,
+            CGEventType::KeyDown, CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+        ];
 
-        // Spawn a polling thread that reads mouse position at ~250 Hz.
-        // Sends normalized absolute coordinates (0.0–1.0) so the engine can do
-        // edge detection and the peer can map to its own resolution.
+        // CGEventTap is not Send — create it inside the dedicated thread.
         std::thread::spawn(move || {
-            log::info!("capture thread started, polling at ~250Hz");
-            let display = CGDisplay::main();
-            let mut last_x: f32 = -1.0;
-            let mut last_y: f32 = -1.0;
-            let mut tick: u32 = 0;
+            let state = TapState {
+                is_remote,
+                tx: tx.clone(),
+                screen_w,
+                screen_h,
+            };
+            let state_ref: &'static TapState = Box::leak(Box::new(state)); // lives forever
 
-            while capturing.load(Ordering::SeqCst) {
-                let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                        continue;
-                    }
-                };
-
-                // CGEvent::new() creates a null event whose location is the CURRENT
-                // cursor position — the correct way to read it. (new_mouse_event with
-                // a (0,0) position would always read (0,0).)
-                if let Ok(event) = CGEvent::new(source) {
-                    let loc = event.location();
-                    let w = display.pixels_wide().max(1) as f32;
-                    let h = display.pixels_high().max(1) as f32;
-                    let nx = (loc.x as f32 / w).clamp(0.0, 1.0);
-                    let ny = (loc.y as f32 / h).clamp(0.0, 1.0);
-
-                    if (nx - last_x).abs() > 0.0005 || (ny - last_y).abs() > 0.0005 {
-                        last_x = nx;
-                        last_y = ny;
-                        let _ = tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
-                    }
-
-                    // Heartbeat so we can confirm the capture loop is alive + reading positions.
-                    tick = tick.wrapping_add(1);
-                    if tick % 500 == 0 {
-                        log::debug!("capture: nx={:.4} ny={:.4}", nx, ny);
-                    }
+            let tap = match CGEventTap::new(
+                CGEventTapLocation::HID,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                event_types,
+                move |proxy, etype, event| {
+                    tap_callback(proxy, etype, event, state_ref)
+                },
+            ) {
+                Ok(t) => t,
+                Err(()) => {
+                    log::error!(
+                        "CGEventTap failed — grant Accessibility + Input Monitoring in System Settings"
+                    );
+                    return;
                 }
+            };
 
-                // ~250 Hz polling for low-latency cursor tracking
-                std::thread::sleep(std::time::Duration::from_millis(4));
+            log::info!(
+                "CGEventTap created (HID, active); screen {}x{}",
+                screen_w as u32, screen_h as u32
+            );
+
+            unsafe {
+                let source = tap.mach_port.create_runloop_source(0)
+                    .expect("CFMachPortCreateRunLoopSource");
+                let run_loop = CFRunLoop::get_current();
+                run_loop.add_source(&source, kCFRunLoopCommonModes);
+                tap.enable();
+                log::info!("CGEventTap thread running");
+                CFRunLoop::run_current();
             }
         });
 
@@ -96,7 +206,9 @@ impl PlatformInput for MacOSInput {
     }
 
     fn stop_capture(&self) -> anyhow::Result<()> {
-        self.capturing.store(false, Ordering::SeqCst);
+        // The CFRunLoop thread can't be stopped cleanly from outside —
+        // it lives until the process exits. This is acceptable for a
+        // system-tray-style app.
         Ok(())
     }
 
@@ -212,6 +324,10 @@ impl PlatformInput for MacOSInput {
 
     fn check_permission(&self) -> bool {
         check_accessibility_trusted()
+    }
+
+    fn set_is_remote(&self, remote: bool) {
+        self.tap_is_remote.store(remote, Ordering::Relaxed);
     }
 
     fn get_screen_size(&self) -> anyhow::Result<(u32, u32)> {

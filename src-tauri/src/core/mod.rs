@@ -32,9 +32,6 @@ pub enum CursorOwner {
 struct EngineState {
     role: Role,
     cursor_owner: CursorOwner,
-    /// Last host cursor position (normalized) — used to compute deltas while
-    /// the cursor is logically on a remote screen.
-    remote_origin: Option<(f32, f32)>,
     /// Client-side: whether the cursor has moved away from the entry edge.
     /// The return-edge check only fires once armed, preventing immediate
     /// bounce-back on entry.
@@ -46,7 +43,6 @@ impl EngineState {
         Self {
             role: Role::None,
             cursor_owner: CursorOwner::Local,
-            remote_origin: None,
             cursor_armed: false,
         }
     }
@@ -63,9 +59,6 @@ pub struct Engine {
 
 /// Normalized distance from the client's host-facing edge that returns the cursor.
 const EDGE_ZONE: f32 = 0.01;
-/// When the host cursor (hidden) gets this close to any edge while controlling
-/// a remote screen, we warp it back to center ("infinite mouse").
-const WARP_MARGIN: f32 = 0.15;
 
 impl Engine {
     pub fn new(
@@ -199,17 +192,18 @@ impl Engine {
             let mut s = self.state.lock().await;
             s.role = Role::Host;
             s.cursor_owner = CursorOwner::Local;
-            s.remote_origin = None;
+            s.cursor_armed = false;
         }
         let mut capture_rx = {
             let p = self.platform.lock().await;
+            p.set_is_remote(false);
             p.start_capture()?
         };
         {
             let p = self.platform.lock().await;
             p.show_cursor().ok();
         }
-        log::info!("Started as Host — capturing input");
+        log::info!("Started as Host — CGEventTap capturing input");
 
         let engine = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -304,9 +298,10 @@ impl Engine {
             let mut s = self.state.lock().await;
             s.role = Role::None;
             s.cursor_owner = CursorOwner::Local;
-            s.remote_origin = None;
             s.cursor_armed = false;
         }
+        let p = self.platform.lock().await;
+        p.set_is_remote(false);
         let p = self.platform.lock().await;
         p.stop_capture().ok();
         p.show_cursor().ok();
@@ -390,18 +385,17 @@ impl Engine {
                                 let _ = self.network.send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny }).await;
                                 log::info!("-> CursorEnter to peer {} at ({:.3},{:.3})", peer_id, nx, ny);
 
-                                // Hide our cursor and warp to center (so we can capture deltas freely).
+                                // Tell the tap to drop events from the host OS.
                                 {
                                     let p = self.platform.lock().await;
+                                    p.set_is_remote(true);
                                     p.hide_cursor().ok();
-                                    p.warp_cursor((w / 2) as i32, (h / 2) as i32).ok();
                                 }
                                 {
                                     let mut s = self.state.lock().await;
                                     s.cursor_owner = CursorOwner::Remote(peer_id);
-                                    s.remote_origin = Some((0.5, 0.5)); // we warped to center
                                 }
-                                log::info!("host: cursor hidden + warped, owner=Remote({})", peer_id);
+                                log::info!("host: is_remote=true, owner=Remote({})", peer_id);
                                 return;
                             }
                         }
@@ -410,43 +404,23 @@ impl Engine {
                 // Otherwise: cursor on local screen, nothing to forward.
             }
             CursorOwner::Remote(peer_id) => {
-                // Cursor logically on the remote screen. Forward input there.
+                // Cursor logically on the remote screen. The tap supplies raw
+                // mouse deltas, clicks, keys, and scroll. Forward all of them.
                 match event {
-                    InputEvent::MouseMoveAbsolute { x, y } => {
-                        // Compute normalized delta from last origin.
-                        let (dx_n, dy_n, near_edge) = {
-                            let s = self.state.lock().await;
-                            let origin = s.remote_origin.unwrap_or((0.5, 0.5));
-                            let dx = x - origin.0;
-                            let dy = y - origin.1;
-                            let near_edge = *x < WARP_MARGIN || *x > 1.0 - WARP_MARGIN
-                                || *y < WARP_MARGIN || *y > 1.0 - WARP_MARGIN;
-                            (dx, dy, near_edge)
-                        };
-
-                        if near_edge {
-                            // Hidden host cursor reached a Mac edge: warp back to
-                            // center so movement can continue unbounded. Do NOT send
-                            // a delta this frame — it would be a large jump.
-                            let (w, h) = {
-                                let p = self.platform.lock().await;
-                                p.get_screen_size().unwrap_or((1920, 1080))
-                            };
+                    InputEvent::MouseMove { dx, dy } => {
+                        // Raw HID pixel deltas from the tap — normalize to host
+                        // screen size so the client can scale by its own.
+                        let (w, h) = {
                             let p = self.platform.lock().await;
-                            p.warp_cursor((w / 2) as i32, (h / 2) as i32).ok();
-                            drop(p);
-                            log::debug!("infinite-mouse warp (no-send)");
-                            self.state.lock().await.remote_origin = Some((0.5, 0.5));
-                        } else {
-                            // Forward the small per-frame delta; client scales by its size.
-                            if dx_n.abs() > 0.0002 || dy_n.abs() > 0.0002 {
-                                log::debug!("-> MouseMoveNormalized dx={:.4} dy={:.4}", dx_n, dy_n);
-                                let _ = self.network.send_to(
-                                    &peer_id,
-                                    InputEvent::MouseMoveNormalized { dx: dx_n, dy: dy_n },
-                                ).await;
-                            }
-                            self.state.lock().await.remote_origin = Some((*x, *y));
+                            p.get_screen_size().unwrap_or((1920, 1080))
+                        };
+                        let dx_n = *dx as f32 / (w as f32).max(1.0);
+                        let dy_n = *dy as f32 / (h as f32).max(1.0);
+                        if dx_n.abs() > 0.0001 || dy_n.abs() > 0.0001 {
+                            let _ = self.network.send_to(
+                                &peer_id,
+                                InputEvent::MouseMoveNormalized { dx: dx_n, dy: dy_n },
+                            ).await;
                         }
                     }
                     // Clicks, keys, scroll — forward directly.
@@ -474,21 +448,20 @@ impl Engine {
                 log::info!("<- CursorEnter from {} at ({:.3},{:.3})", from, x, y);
             }
             InputEvent::CursorLeave => {
-                // Client returned the cursor to us (host). Reclaim it:
-                // show our cursor and warp it well inside the screen (clear of the
-                // edge zone) so it doesn't instantly re-trigger a handoff.
+                // Client returned the cursor to us (host). Reclaim it — tell the
+                // tap to let events pass through again, show our cursor.
                 {
                     let mut s = self.state.lock().await;
                     s.cursor_owner = CursorOwner::Local;
-                    s.remote_origin = None;
                     s.cursor_armed = false;
                 }
                 let p = self.platform.lock().await;
+                p.set_is_remote(false);
                 p.show_cursor().ok();
                 if let Ok((w, h)) = p.get_screen_size() {
                     p.warp_cursor((w as f32 * 0.75) as i32, (h / 2) as i32).ok();
                 }
-                log::info!("<- CursorLeave from {}, owner=Local", from);
+                log::info!("<- CursorLeave from {}, owner=Local, is_remote=false", from);
             }
             other => {
                 // Regular input event — inject if a remote owns the cursor.
