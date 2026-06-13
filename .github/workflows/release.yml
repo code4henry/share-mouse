@@ -10,21 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  # Create the (draft) release first so parallel build jobs can upload to it.
-  create-release:
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "ShareMouse ${{ github.ref_name }}" \
-            --notes "Cross-platform mouse & keyboard sharing app. See assets below." \
-            --draft \
-            || echo "release may already exist"
-
   build:
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -73,14 +59,14 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: npm run tauri build -- --target aarch64-apple-darwin
 
-      - name: Re-sign and repackage dmg (macOS)
+      - name: Re-sign, repackage dmg, upload (macOS)
         if: matrix.platform == 'macos-latest'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
         run: |
           set -e
           APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/ShareMouse.app"
-          VERSION="${{ github.ref_name }}"
 
           # Re-sign the whole bundle with a clean ad-hoc signature.
           # Tauri's default ad-hoc signature is inconsistent ("code has no
@@ -91,12 +77,15 @@ jobs:
 
           # Build a fresh drag-to-Applications dmg from the re-signed app.
           STAGING="$RUNNER_TEMP/dmg-staging"
-          mkdir -p "$STAGING"
+          rm -rf "$STAGING" && mkdir -p "$STAGING"
           cp -R "$APP" "$STAGING/"
           ln -s /Applications "$STAGING/Applications"
           DMG="ShareMouse_${VERSION}_aarch64.dmg"
           hdiutil create -volname ShareMouse -srcfolder "$STAGING" -ov -format UDZO "$DMG"
 
+          # Create the release if it doesn't exist yet, then upload.
+          gh release create "$VERSION" --title "ShareMouse $VERSION" \
+            --notes "Cross-platform mouse & keyboard sharing app." --draft || true
           gh release upload "$VERSION" "$DMG" --clobber
 
       # ── Windows: standard build, upload exe + msi ──
@@ -104,13 +93,16 @@ jobs:
         if: matrix.platform == 'windows-latest'
         run: npm run tauri build
 
-      - name: Upload Windows assets
+      - name: Create release and upload Windows assets
         if: matrix.platform == 'windows-latest'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          $version = "${{ github.ref_name }}"
-          gh release upload $version `
+          $ErrorActionPreference = "Stop"
+          gh release create $env:VERSION --title "ShareMouse $env:VERSION" --notes "Cross-platform mouse & keyboard sharing app." --draft
+          if ($LASTEXITCODE -ne 0) { Write-Host "release may already exist, continuing" }
+          gh release upload $env:VERSION `
             (Get-Item src-tauri/target/release/bundle/nsis/*.exe) `
             (Get-Item src-tauri/target/release/bundle/msi/*.msi) `
             --clobber
