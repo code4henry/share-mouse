@@ -104,6 +104,17 @@ impl Engine {
                     Ok(NetworkMessage::PeerDisconnected { id }) => {
                         log::info!("Peer disconnected: {}", id);
                         engine.remove_remote_screen(id).await;
+                        // If the disconnected peer owns the cursor, reclaim it.
+                        let owner = engine.state.lock().await.cursor_owner;
+                        if let CursorOwner::Remote(pid) = owner {
+                            if pid == id {
+                                log::warn!("peer {} disconnected while owning cursor — reclaiming to Local", id);
+                                engine.state.lock().await.cursor_owner = CursorOwner::Local;
+                                let p = engine.platform.lock().await;
+                                p.set_is_remote(false);
+                                p.show_cursor().ok();
+                            }
+                        }
                     }
                     Ok(NetworkMessage::Listening { addr }) => {
                         log::info!("Listening on {}", addr);
@@ -391,8 +402,13 @@ impl Engine {
 
                         if let Some(peer_id_str) = neighbor_peer {
                             if let Ok(peer_id) = uuid::Uuid::parse_str(&peer_id_str) {
-                                // Tell the peer to take the cursor.
-                                let _ = self.network.send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny }).await;
+                                // Tell the peer to take the cursor. If the send fails
+                                // (peer disconnected / channel full), stay Local — don't
+                                // enter a broken Remote state.
+                                if self.network.send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny }).await.is_err() {
+                                    log::warn!("send CursorEnter to {} failed — staying Local", peer_id);
+                                    return;
+                                }
                                 log::info!("-> CursorEnter to peer {} at ({:.3},{:.3})", peer_id, nx, ny);
 
                                 // Tell the tap to drop events from the host OS.

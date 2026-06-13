@@ -11,11 +11,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
+use core_foundation::runloop::kCFRunLoopCommonModes;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, CGMouseButton, EventField, CGEventTap,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -29,101 +28,177 @@ fn default_source() -> CGEventSource {
         .expect("create CGEventSource")
 }
 
-// ── CGEventTap state ────────────────────────────────────
+// ── CGEventTap state (raw FFI) ──────────────────────────
 
-/// Shared state between the tap callback (called on the CFRunLoop thread)
-/// and the engine (called on the async runtime).  The tap reads `is_remote`
-/// to decide whether to drop events from the host OS.
+/// Shared state between the raw tap callback and the engine.
 struct TapState {
     is_remote: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<InputEvent>,
-    screen_w: f32,
+    screen_w: f32,  // logical points (CGDisplayBounds)
     screen_h: f32,
+    /// Previous modifier flags for FlagsChanged → proper KeyUp/KeyDown.
+    prev_modifiers: std::sync::atomic::AtomicU64,
+    /// Dropped-event counter (logged periodically when non-zero).
+    drops: std::sync::atomic::AtomicU64,
 }
 
-/// Whether the event type carries cursor position (for edge-detection feed).
-fn is_mouse_or_click(t: CGEventType) -> bool {
-    use CGEventType::*;
-    matches!(t,
-        MouseMoved | LeftMouseDown | LeftMouseUp
-        | RightMouseDown | RightMouseUp
-        | OtherMouseDown | OtherMouseUp
-        | LeftMouseDragged | RightMouseDragged | OtherMouseDragged
+fn is_pos_event(et: u32) -> bool {
+    matches!(et,
+        KCG_EVENT_MOUSE_MOVED
+        | KCG_EVENT_LEFT_DOWN | KCG_EVENT_LEFT_UP
+        | KCG_EVENT_RIGHT_DOWN | KCG_EVENT_RIGHT_UP
+        | KCG_EVENT_OTHER_DOWN | KCG_EVENT_OTHER_UP
+        | KCG_EVENT_LEFT_DRAGGED | KCG_EVENT_RIGHT_DRAGGED | KCG_EVENT_OTHER_DRAGGED
     )
 }
 
-/// Convert a tap CGEventType + event into a MouseButton.
-fn button_from_tap(et: CGEventType, _event: &CGEvent) -> MouseButton {
-    use CGEventType::*;
+fn btn_from_type(et: u32, _event: *mut std::ffi::c_void) -> MouseButton {
     match et {
-        LeftMouseDown | LeftMouseUp | LeftMouseDragged => MouseButton::Left,
-        RightMouseDown | RightMouseUp | RightMouseDragged => MouseButton::Right,
-        _ => MouseButton::Middle, // OtherMouse* — could read MOUSE_EVENT_BUTTON_NUMBER for precision
+        KCG_EVENT_LEFT_DOWN | KCG_EVENT_LEFT_UP | KCG_EVENT_LEFT_DRAGGED => MouseButton::Left,
+        KCG_EVENT_RIGHT_DOWN | KCG_EVENT_RIGHT_UP | KCG_EVENT_RIGHT_DRAGGED => MouseButton::Right,
+        _ => {
+            // Other — read real button number
+            let n = unsafe { CGEventGetIntegerValueField(_event, KCG_FIELD_MOUSE_BTN) } as u8;
+            MouseButton::Other(n)
+        }
     }
 }
 
-/// The tap callback — runs on the CFRunLoop thread, must not block.
-/// Uses `blocking_send` so events are never silently dropped; backpressure
-/// naturally limits the forwarding rate.
-fn tap_callback(
+/// Raw FFI callback — returns NULL to drop the event, or the event to pass it
+/// through. Must be `unsafe extern "C"` with no unwinding.
+unsafe extern "C" fn raw_tap_callback(
     _proxy: *const std::ffi::c_void,
-    event_type: CGEventType,
-    event: &CGEvent,
+    event_type: u32,
+    event: *mut std::ffi::c_void,
+    user_info: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if user_info.is_null() || event.is_null() {
+            return event;
+        }
+        let state = &*(user_info as *const TapState);
+        tap_callback_impl(event_type, event, state)
+    }));
+    match result {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(), // panic → drop event
+    }
+}
+
+/// The implementation — called from raw_tap_callback. Returns a raw CGEventRef.
+fn tap_callback_impl(
+    event_type: u32,
+    event: *mut std::ffi::c_void,
     state: &TapState,
-) -> Option<CGEvent> {
+) -> *mut std::ffi::c_void {
     let remote = state.is_remote.load(Ordering::Relaxed);
 
     if remote {
-        // ── Remote: drop EVERYTHING from the host OS, forward to client ──
+        // ── Remote: drop from host, forward to client ──
         match event_type {
-            CGEventType::MouseMoved => {
-                let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i16;
-                let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i16;
+            KCG_EVENT_MOUSE_MOVED | KCG_EVENT_LEFT_DRAGGED
+            | KCG_EVENT_RIGHT_DRAGGED | KCG_EVENT_OTHER_DRAGGED => {
+                let dx = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_DELTA_X) } as i16;
+                let dy = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_DELTA_Y) } as i16;
                 if dx != 0 || dy != 0 {
-                    let _ = state.tx.blocking_send(InputEvent::MouseMove { dx, dy });
+                    if state.tx.try_send(InputEvent::MouseMove { dx, dy }).is_err() {
+                        state.drops.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
-            CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
-                let btn = button_from_tap(event_type, event);
-                let _ = state.tx.blocking_send(InputEvent::MouseDown { button: btn });
+            KCG_EVENT_LEFT_DOWN | KCG_EVENT_RIGHT_DOWN | KCG_EVENT_OTHER_DOWN => {
+                let btn = btn_from_type(event_type, event);
+                if state.tx.try_send(InputEvent::MouseDown { button: btn }).is_err() {
+                    state.drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp => {
-                let btn = button_from_tap(event_type, event);
-                let _ = state.tx.blocking_send(InputEvent::MouseUp { button: btn });
+            KCG_EVENT_LEFT_UP | KCG_EVENT_RIGHT_UP | KCG_EVENT_OTHER_UP => {
+                let btn = btn_from_type(event_type, event);
+                if state.tx.try_send(InputEvent::MouseUp { button: btn }).is_err() {
+                    state.drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CGEventType::ScrollWheel => {
-                let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-                let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
-                let _ = state.tx.blocking_send(InputEvent::Scroll { dx: dx as i16, dy: dy as i16 });
+            KCG_EVENT_SCROLL_WHEEL => {
+                let dy = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_SCROLL_AXIS_1) } as i16;
+                let dx = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_SCROLL_AXIS_2) } as i16;
+                if state.tx.try_send(InputEvent::Scroll { dx, dy }).is_err() {
+                    state.drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CGEventType::KeyDown => {
-                let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                let mods = extract_modifiers(event);
-                let _ = state.tx.blocking_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods });
+            KCG_EVENT_KEY_DOWN => {
+                let kc = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_KEYCODE) } as u16;
+                let mods = raw_modifiers(unsafe { CGEventGetFlags(event) });
+                if state.tx.try_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods }).is_err() {
+                    state.drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CGEventType::KeyUp => {
-                let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                let mods = extract_modifiers(event);
-                let _ = state.tx.blocking_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods });
+            KCG_EVENT_KEY_UP => {
+                let kc = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_KEYCODE) } as u16;
+                let mods = raw_modifiers(unsafe { CGEventGetFlags(event) });
+                if state.tx.try_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods }).is_err() {
+                    state.drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            CGEventType::FlagsChanged => {
-                // Modifier-only change — forward modifiers via a fake key event.
-                let mods = extract_modifiers(event);
-                let _ = state.tx.blocking_send(InputEvent::KeyDown { keycode: 0, modifiers: mods });
+            KCG_EVENT_FLAGS_CHANGED => {
+                let new_flags = unsafe { CGEventGetFlags(event) };
+                let prev = state.prev_modifiers.swap(new_flags, Ordering::Relaxed);
+                let delta = new_flags ^ prev;
+                if delta != 0 {
+                    // Determine which modifier keys changed from the NSEvent flags.
+                    // macos modifier flag bits (same as CGEventFlags):
+                    const NX_SHIFTMASK:   u64 = 1 << 17; // 0x20000
+                    const NX_CONTROLMASK: u64 = 1 << 18; // 0x40000
+                    const NX_ALTERNATEMASK: u64 = 1 << 19; // 0x80000
+                    const NX_COMMANDMASK: u64 = 1 << 20; // 0x100000
+                    const ALL: u64 = NX_SHIFTMASK | NX_CONTROLMASK | NX_ALTERNATEMASK | NX_COMMANDMASK;
+                    let ks = [(ALL & delta & NX_SHIFTMASK, 56u16),   // kVK_Shift
+                              (ALL & delta & NX_CONTROLMASK, 59u16), // kVK_Control
+                              (ALL & delta & NX_ALTERNATEMASK, 58u16), // kVK_Option
+                              (ALL & delta & NX_COMMANDMASK, 55u16)]; // kVK_Command
+                    for (m, kc) in ks {
+                        if m != 0 {
+                            let down = (new_flags & m) != 0;
+                            let mods = raw_modifiers(new_flags);
+                            let evt = if down {
+                                InputEvent::KeyDown { keycode: kc, modifiers: mods }
+                            } else {
+                                InputEvent::KeyUp { keycode: kc, modifiers: mods }
+                            };
+                            if state.tx.try_send(evt).is_err() {
+                                state.drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
-        return None; // DROP — host OS never sees this event
+        // DROP from host OS — return NULL
+        return std::ptr::null_mut();
     }
 
-    // ── Local: feed cursor position for edge detection, let OS process ──
-    if is_mouse_or_click(event_type) {
-        let loc = event.location();
+    // ── Local: feed cursor position for edge detection, pass through ──
+    if is_pos_event(event_type) {
+        let loc = unsafe { CGEventGetLocation(event) };
         let nx = (loc.x as f32 / state.screen_w).clamp(0.0, 1.0);
         let ny = (loc.y as f32 / state.screen_h).clamp(0.0, 1.0);
-        let _ = state.tx.blocking_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
+        if state.tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny }).is_err() {
+            state.drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
-    Some(event.clone()) // pass-through to OS
+    // Pass through — retain and return (system will release original)
+    unsafe { CGEventCreateCopy(event) }
+}
+
+/// Read modifier flags from raw CGEventFlags into our Modifiers bitmask.
+fn raw_modifiers(raw: u64) -> Modifiers {
+    let mut m = Modifiers::NONE;
+    if raw & 0x20000 != 0 { m |= Modifiers::SHIFT; }   // NX_SHIFTMASK
+    if raw & 0x40000 != 0 { m |= Modifiers::CTRL; }    // NX_CONTROLMASK
+    if raw & 0x80000 != 0 { m |= Modifiers::ALT; }     // NX_ALTERNATEMASK
+    if raw & 0x100000 != 0 { m |= Modifiers::META; }   // NX_COMMANDMASK
+    if raw & 0x10000 != 0 { m |= Modifiers::CAPS; }    // NX_ALPHASHIFTMASK
+    m
 }
 
 pub struct MacOSInput {
@@ -141,73 +216,77 @@ impl MacOSInput {
 
 impl PlatformInput for MacOSInput {
     fn start_capture(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<InputEvent>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(2048);
 
         let is_remote = self.tap_is_remote.clone();
-        let display = CGDisplay::main();
-        let screen_w = display.pixels_wide().max(1) as f32;
-        let screen_h = display.pixels_high().max(1) as f32;
-        let event_types = vec![
-            CGEventType::MouseMoved,
-            CGEventType::LeftMouseDown,  CGEventType::LeftMouseUp,
-            CGEventType::RightMouseDown, CGEventType::RightMouseUp,
-            CGEventType::OtherMouseDown, CGEventType::OtherMouseUp,
-            CGEventType::LeftMouseDragged, CGEventType::RightMouseDragged,
-            CGEventType::OtherMouseDragged,
-            CGEventType::ScrollWheel,
-            CGEventType::KeyDown, CGEventType::KeyUp,
-            CGEventType::FlagsChanged,
-        ];
 
-        // CGEventTap is not Send — create it inside the dedicated thread.
+        // Use CGDisplayBounds (logical points, Retina-safe) not pixels_wide()
+        let bounds = unsafe { CGDisplayBounds(CGDisplay::main().id) };
+        let screen_w = bounds.size.width.max(1.0) as f32;
+        let screen_h = bounds.size.height.max(1.0) as f32;
+
+        // Build TapState on the heap; the raw callback receives its pointer.
+        let state = Box::new(TapState {
+            is_remote,
+            tx: tx.clone(),
+            screen_w,
+            screen_h,
+            prev_modifiers: std::sync::atomic::AtomicU64::new(0),
+            drops: std::sync::atomic::AtomicU64::new(0),
+        });
+        let state_ptr = Box::into_raw(state) as *mut std::ffi::c_void;
+        let state_ptr_addr = state_ptr as usize; // raw ptr → Send-safe integer
+
+        let tap: *mut std::ffi::c_void = unsafe {
+            CGEventTapCreate(
+                KCG_HID_EVENT_TAP,
+                KCG_HEAD_INSERT_EVENT_TAP,
+                KCG_EVENT_TAP_OPTION_DEFAULT,
+                KCG_EVENT_MASK,
+                raw_tap_callback,
+                state_ptr,
+            )
+        };
+
+        if tap.is_null() {
+            unsafe { drop(Box::from_raw(state_ptr as *mut TapState)); }
+            anyhow::bail!(
+                "CGEventTap failed — grant Accessibility + Input Monitoring in System Settings"
+            );
+        }
+
+        let tap_addr = tap as usize; // Send-safe handle
+
+        log::info!(
+            "Raw CGEventTap created (HID, active); logical screen {:.0}x{:.0}",
+            screen_w, screen_h
+        );
+
         std::thread::spawn(move || {
-            let state = TapState {
-                is_remote,
-                tx: tx.clone(),
-                screen_w,
-                screen_h,
-            };
-            let state_ref: &'static TapState = Box::leak(Box::new(state)); // lives forever
-
-            let tap = match CGEventTap::new(
-                CGEventTapLocation::HID,
-                CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
-                event_types,
-                move |proxy, etype, event| {
-                    // catch_unwind prevents a panic from crossing the FFI boundary
-                    // (UB). If the callback panics, drop the event.
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tap_callback(proxy, etype, event, state_ref)
-                    }))
-                    .unwrap_or_else(|_| {
-                        log::error!("tap callback panicked — dropping event");
-                        None
-                    })
-                },
-            ) {
-                Ok(t) => t,
-                Err(()) => {
-                    log::error!(
-                        "CGEventTap failed — grant Accessibility + Input Monitoring in System Settings"
-                    );
+            let tap: *mut std::ffi::c_void = tap_addr as *mut std::ffi::c_void;
+            let state_ptr = state_ptr_addr as *mut std::ffi::c_void;
+            unsafe {
+                let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+                if source.is_null() {
+                    log::error!("CFMachPortCreateRunLoopSource failed");
                     return;
                 }
-            };
+                let rl = CFRunLoopGetCurrent();
+                CFRunLoopAddSource(
+                    rl,
+                    source,
+                    kCFRunLoopCommonModes as *const std::ffi::c_void,
+                );
+                CGEventTapEnable(tap, true);
+                log::info!("Raw CGEventTap thread running");
+                CFRunLoopRun();
 
-            log::info!(
-                "CGEventTap created (HID, active); screen {}x{}",
-                screen_w as u32, screen_h as u32
-            );
-
-            unsafe {
-                let source = tap.mach_port.create_runloop_source(0)
-                    .expect("CFMachPortCreateRunLoopSource");
-                let run_loop = CFRunLoop::get_current();
-                run_loop.add_source(&source, kCFRunLoopCommonModes);
-                tap.enable();
-                log::info!("CGEventTap thread running");
-                CFRunLoop::run_current();
+                // Log dropped events on exit
+                let state = &*(state_ptr as *const TapState);
+                let d = state.drops.load(Ordering::Relaxed);
+                if d > 0 {
+                    log::warn!("Tap exiting; {} events dropped due to channel full", d);
+                }
             }
         });
 
@@ -392,9 +471,85 @@ fn mouse_button_to_cg(button: MouseButton) -> CGMouseButton {
 }
 
 extern "C" {
-    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint);
+    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
     fn AXIsProcessTrusted() -> u8;
+    // Raw CGEventTap FFI — bypasses core-graphics 0.24.0's broken None→event bug
+    fn CGEventTapCreate(
+        tap: u32, place: u32, options: u32,
+        eventsOfInterest: u64,
+        callback: RawTapCallback,
+        userInfo: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const std::ffi::c_void,
+        port: *mut std::ffi::c_void,
+        order: isize,
+    ) -> *mut std::ffi::c_void;
+    fn CFRunLoopAddSource(
+        rl: *mut std::ffi::c_void,
+        source: *mut std::ffi::c_void,
+        mode: *const std::ffi::c_void,
+    );
+    fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
+    fn CFRunLoopRun();
+    fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    // Event accessors on a raw CGEventRef
+    fn CGEventGetType(event: *mut std::ffi::c_void) -> u32;
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
+    fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
+    fn CGEventCreateCopy(event: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGDisplayBounds(display: u32) -> core_graphics::geometry::CGRect;
+    fn CFRelease(cf: *mut std::ffi::c_void);
 }
+
+type RawTapCallback = unsafe extern "C" fn(
+    proxy: *const std::ffi::c_void,
+    event_type: u32,
+    event: *mut std::ffi::c_void,
+    user_info: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
+
+// CGEventTap constants (not exposed by the crate)
+const KCG_HID_EVENT_TAP: u32 = 0;
+const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+
+// CGEventType values we match on
+const KCG_EVENT_MOUSE_MOVED: u32 = 5;
+const KCG_EVENT_LEFT_DOWN: u32 = 1;
+const KCG_EVENT_LEFT_UP: u32 = 2;
+const KCG_EVENT_RIGHT_DOWN: u32 = 3;
+const KCG_EVENT_RIGHT_UP: u32 = 4;
+const KCG_EVENT_OTHER_DOWN: u32 = 25;
+const KCG_EVENT_OTHER_UP: u32 = 26;
+const KCG_EVENT_LEFT_DRAGGED: u32 = 6;
+const KCG_EVENT_RIGHT_DRAGGED: u32 = 7;
+const KCG_EVENT_OTHER_DRAGGED: u32 = 27;
+const KCG_EVENT_SCROLL_WHEEL: u32 = 22;
+const KCG_EVENT_KEY_DOWN: u32 = 10;
+const KCG_EVENT_KEY_UP: u32 = 11;
+const KCG_EVENT_FLAGS_CHANGED: u32 = 12;
+
+// EventField raw values (same as crate's EventField)
+const KCG_FIELD_DELTA_X: u32 = 4;
+const KCG_FIELD_DELTA_Y: u32 = 5;
+const KCG_FIELD_SCROLL_AXIS_1: u32 = 11;
+const KCG_FIELD_SCROLL_AXIS_2: u32 = 12;
+const KCG_FIELD_KEYCODE: u32 = 9;
+const KCG_FIELD_MOUSE_BTN: u32 = 3;
+
+// Mask of all event types the tap should intercept (bitfield for CGEventTapCreate)
+const KCG_EVENT_MASK: u64 =
+    (1 << KCG_EVENT_MOUSE_MOVED)
+    | (1 << KCG_EVENT_LEFT_DOWN)   | (1 << KCG_EVENT_LEFT_UP)
+    | (1 << KCG_EVENT_RIGHT_DOWN)  | (1 << KCG_EVENT_RIGHT_UP)
+    | (1 << KCG_EVENT_OTHER_DOWN)  | (1 << KCG_EVENT_OTHER_UP)
+    | (1 << KCG_EVENT_LEFT_DRAGGED)| (1 << KCG_EVENT_RIGHT_DRAGGED)
+    | (1 << KCG_EVENT_OTHER_DRAGGED)
+    | (1 << KCG_EVENT_SCROLL_WHEEL)
+    | (1 << KCG_EVENT_KEY_DOWN)    | (1 << KCG_EVENT_KEY_UP)
+    | (1 << KCG_EVENT_FLAGS_CHANGED);
 
 /// Check whether this process has Accessibility permission.
 pub fn check_accessibility_trusted() -> bool {
