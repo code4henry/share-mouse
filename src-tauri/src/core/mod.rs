@@ -35,6 +35,10 @@ struct EngineState {
     /// Last host cursor position (normalized) — used to compute deltas while
     /// the cursor is logically on a remote screen.
     remote_origin: Option<(f32, f32)>,
+    /// Client-side: whether the cursor has moved away from the entry edge.
+    /// The return-edge check only fires once armed, preventing immediate
+    /// bounce-back on entry.
+    cursor_armed: bool,
 }
 
 impl EngineState {
@@ -43,6 +47,7 @@ impl EngineState {
             role: Role::None,
             cursor_owner: CursorOwner::Local,
             remote_origin: None,
+            cursor_armed: false,
         }
     }
 }
@@ -241,10 +246,11 @@ impl Engine {
     /// the edge facing the host — then give the cursor back.
     async fn client_monitor_loop(self: Arc<Self>) {
         loop {
-            let owner = self.state.lock().await.cursor_owner;
-            let is_remote = matches!(owner, CursorOwner::Remote(_));
+            let (is_remote, armed) = {
+                let s = self.state.lock().await;
+                (matches!(s.cursor_owner, CursorOwner::Remote(_)), s.cursor_armed)
+            };
             if is_remote {
-                // Check cursor position against the return edge (left edge).
                 let pos = {
                     let p = self.platform.lock().await;
                     p.get_cursor_pos().ok()
@@ -255,15 +261,33 @@ impl Engine {
                         p.get_screen_size().unwrap_or((1920, 1080))
                     };
                     let nx = if w > 0 { x as f32 / w as f32 } else { 0.0 };
-                    if nx <= EDGE_ZONE {
-                        // Cursor returned to the host-facing edge — give it back.
-                        let peer = if let CursorOwner::Remote(pid) = owner { Some(pid) } else { None };
-                        if let Some(pid) = peer {
-                            log::info!("client_monitor: nx={:.4}, sending CursorLeave to {}", nx, pid);
-                            let _ = self.network.send_to(&pid, InputEvent::CursorLeave).await;
-                            self.state.lock().await.cursor_owner = CursorOwner::Local;
-                            let p = self.platform.lock().await;
-                            p.hide_cursor().ok();
+
+                    if !armed {
+                        // Cursor just entered at the edge; wait for it to move into
+                        // the screen before arming the return check.
+                        let (_, new_armed) = hysteresis_decision(armed, nx);
+                        if new_armed {
+                            self.state.lock().await.cursor_armed = true;
+                            log::debug!("client_monitor: armed (nx={:.3})", nx);
+                        }
+                    } else {
+                        let (should_return, _) = hysteresis_decision(armed, nx);
+                        if should_return {
+                            // Armed and cursor returned to the host-facing edge.
+                            let peer = if let CursorOwner::Remote(pid) = self.state.lock().await.cursor_owner {
+                                Some(pid)
+                            } else {
+                                None
+                            };
+                            if let Some(pid) = peer {
+                                log::info!("client_monitor: nx={:.4} armed, sending CursorLeave to {}", nx, pid);
+                                let _ = self.network.send_to(&pid, InputEvent::CursorLeave).await;
+                                let mut s = self.state.lock().await;
+                                s.cursor_owner = CursorOwner::Local;
+                                s.cursor_armed = false;
+                                let p = self.platform.lock().await;
+                                p.hide_cursor().ok();
+                            }
                         }
                     }
                 }
@@ -281,6 +305,7 @@ impl Engine {
             s.role = Role::None;
             s.cursor_owner = CursorOwner::Local;
             s.remote_origin = None;
+            s.cursor_armed = false;
         }
         let p = self.platform.lock().await;
         p.stop_capture().ok();
@@ -389,27 +414,20 @@ impl Engine {
                 match event {
                     InputEvent::MouseMoveAbsolute { x, y } => {
                         // Compute normalized delta from last origin.
-                        let (dx_n, dy_n, new_origin, need_warp) = {
+                        let (dx_n, dy_n, near_edge) = {
                             let s = self.state.lock().await;
                             let origin = s.remote_origin.unwrap_or((0.5, 0.5));
                             let dx = x - origin.0;
                             let dy = y - origin.1;
                             let near_edge = *x < WARP_MARGIN || *x > 1.0 - WARP_MARGIN
                                 || *y < WARP_MARGIN || *y > 1.0 - WARP_MARGIN;
-                            (dx, dy, (*x, *y), near_edge)
+                            (dx, dy, near_edge)
                         };
 
-                        // Forward as normalized delta — client scales by its own size.
-                        if dx_n.abs() > 0.0002 || dy_n.abs() > 0.0002 {
-                            log::debug!("-> MouseMoveNormalized dx={:.4} dy={:.4}", dx_n, dy_n);
-                            let _ = self.network.send_to(
-                                &peer_id,
-                                InputEvent::MouseMoveNormalized { dx: dx_n, dy: dy_n },
-                            ).await;
-                        }
-
-                        // Infinite-mouse: if near a local edge, warp back to center.
-                        if need_warp {
+                        if near_edge {
+                            // Hidden host cursor reached a Mac edge: warp back to
+                            // center so movement can continue unbounded. Do NOT send
+                            // a delta this frame — it would be a large jump.
                             let (w, h) = {
                                 let p = self.platform.lock().await;
                                 p.get_screen_size().unwrap_or((1920, 1080))
@@ -417,10 +435,18 @@ impl Engine {
                             let p = self.platform.lock().await;
                             p.warp_cursor((w / 2) as i32, (h / 2) as i32).ok();
                             drop(p);
-                            log::debug!("infinite-mouse warp to center");
+                            log::debug!("infinite-mouse warp (no-send)");
                             self.state.lock().await.remote_origin = Some((0.5, 0.5));
                         } else {
-                            self.state.lock().await.remote_origin = Some(new_origin);
+                            // Forward the small per-frame delta; client scales by its size.
+                            if dx_n.abs() > 0.0002 || dy_n.abs() > 0.0002 {
+                                log::debug!("-> MouseMoveNormalized dx={:.4} dy={:.4}", dx_n, dy_n);
+                                let _ = self.network.send_to(
+                                    &peer_id,
+                                    InputEvent::MouseMoveNormalized { dx: dx_n, dy: dy_n },
+                                ).await;
+                            }
+                            self.state.lock().await.remote_origin = Some((*x, *y));
                         }
                     }
                     // Clicks, keys, scroll — forward directly.
@@ -440,6 +466,7 @@ impl Engine {
                 {
                     let mut s = self.state.lock().await;
                     s.cursor_owner = CursorOwner::Remote(from);
+                    s.cursor_armed = false; // disarmed on entry (avoid bounce-back)
                 }
                 let p = self.platform.lock().await;
                 p.show_cursor().ok();
@@ -448,16 +475,18 @@ impl Engine {
             }
             InputEvent::CursorLeave => {
                 // Client returned the cursor to us (host). Reclaim it:
-                // show our cursor and warp it to the right edge where it left.
+                // show our cursor and warp it well inside the screen (clear of the
+                // edge zone) so it doesn't instantly re-trigger a handoff.
                 {
                     let mut s = self.state.lock().await;
                     s.cursor_owner = CursorOwner::Local;
                     s.remote_origin = None;
+                    s.cursor_armed = false;
                 }
                 let p = self.platform.lock().await;
                 p.show_cursor().ok();
                 if let Ok((w, h)) = p.get_screen_size() {
-                    p.warp_cursor((w - 10) as i32, (h / 2) as i32).ok();
+                    p.warp_cursor((w as f32 * 0.75) as i32, (h / 2) as i32).ok();
                 }
                 log::info!("<- CursorLeave from {}, owner=Local", from);
             }
@@ -471,5 +500,56 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+/// Pure decision for the client return-edge hysteresis.
+/// Returns (should_return_cursor, new_armed_state).
+/// - Not armed: arm once the cursor moves past ARM_THRESHOLD into the screen.
+/// - Armed: return the cursor when it comes back to the edge (<= EDGE_ZONE).
+fn hysteresis_decision(armed: bool, nx: f32) -> (bool, bool) {
+    const ARM_THRESHOLD: f32 = 0.06;
+    if !armed {
+        if nx > ARM_THRESHOLD {
+            (false, true) // arm, don't return
+        } else {
+            (false, false) // stay disarmed
+        }
+    } else if nx <= EDGE_ZONE {
+        (true, false) // return + disarm
+    } else {
+        (false, true) // stay armed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hysteresis_does_not_return_on_entry() {
+        // Cursor enters at the left edge (nx≈0); must NOT bounce back.
+        let (ret, armed) = hysteresis_decision(false, 0.0);
+        assert!(!ret, "must not return immediately on entry");
+        assert!(!armed);
+        let (ret, _) = hysteresis_decision(false, 0.005);
+        assert!(!ret, "must not return while still at the edge");
+    }
+
+    #[test]
+    fn hysteresis_arms_after_moving_in() {
+        let (_, armed) = hysteresis_decision(false, 0.1); // moved into screen
+        assert!(armed);
+    }
+
+    #[test]
+    fn hysteresis_returns_only_when_armed_and_back_at_edge() {
+        // Armed, cursor moves back to the edge → return.
+        let (ret, armed) = hysteresis_decision(true, 0.0);
+        assert!(ret, "should return when armed and back at edge");
+        assert!(!armed);
+        // Armed but mid-screen → no return.
+        let (ret, _) = hysteresis_decision(true, 0.5);
+        assert!(!ret);
     }
 }
