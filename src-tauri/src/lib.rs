@@ -3,12 +3,58 @@ mod core;
 mod platform;
 
 use std::sync::Arc;
+use std::fs;
+use std::path::PathBuf;
 use commands::AppState;
 use core::{Engine, network::NetworkHub};
 use platform::create_platform_input;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── File logger setup ────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    let log_dir = {
+        let mut p = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default());
+        p.push("ShareMouse");
+        fs::create_dir_all(&p).ok();
+        p
+    };
+    #[cfg(not(target_os = "windows"))]
+    let log_dir = {
+        let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        p.push("Library");
+        p.push("Logs");
+        p.push("ShareMouse");
+        fs::create_dir_all(&p).ok();
+        p
+    };
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("share-mouse.log"))
+        .expect("failed to open log file");
+
+    // Log to file + keep the tauri_plugin_log for dev tools
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{:5}] {}",
+                record.level(),
+                message
+            ))
+        })
+        .level(if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        .chain(log_file)
+        .apply()
+        .expect("failed to init logger");
+
+    log::info!("ShareMouse v{} starting", env!("CARGO_PKG_VERSION"));
+
     // Create platform input handler
     let platform_input = create_platform_input();
 

@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Logging
 log = "0.4"
+fern = "0.7"
 
 # Utilities
 anyhow = "1.0"

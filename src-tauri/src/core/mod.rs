@@ -306,7 +306,7 @@ impl Engine {
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             } else {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
