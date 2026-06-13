@@ -3,6 +3,8 @@ mod core;
 mod platform;
 
 use std::sync::Arc;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
 use commands::AppState;
 use core::{Engine, network::NetworkHub};
 use platform::create_platform_input;
@@ -75,6 +77,35 @@ pub fn run() {
     });
 
     tauri::Builder::default()
+        .setup(|app| {
+            // System tray: keep the process alive when the window is hidden.
+            // Windows throttles SendInput/SetCursorPos for minimized windows;
+            // hiding to tray instead prevents that throttling.
+            let _tray = TrayIconBuilder::with_id("share-mouse")
+                .tooltip("ShareMouse")
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        // Show & focus the main window on tray click.
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // Close → hide to tray (input injection keeps working).
+                let _ = window.hide();
+            }
+        })
         .plugin(
             tauri_plugin_log::Builder::default()
                 .targets([
