@@ -63,6 +63,8 @@ fn button_from_tap(et: CGEventType, _event: &CGEvent) -> MouseButton {
 }
 
 /// The tap callback — runs on the CFRunLoop thread, must not block.
+/// Uses `blocking_send` so events are never silently dropped; backpressure
+/// naturally limits the forwarding rate.
 fn tap_callback(
     _proxy: *const std::ffi::c_void,
     event_type: CGEventType,
@@ -71,58 +73,57 @@ fn tap_callback(
 ) -> Option<CGEvent> {
     let remote = state.is_remote.load(Ordering::Relaxed);
 
-    // Always feed cursor position for edge detection (not clicks though — edge
-    // detection only cares about MouseMoved / Drag absolute position).
-    if is_mouse_or_click(event_type) {
-        let loc = event.location();
-        let nx = (loc.x as f32 / state.screen_w).clamp(0.0, 1.0);
-        let ny = (loc.y as f32 / state.screen_h).clamp(0.0, 1.0);
-        let _ = state.tx.try_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
-    }
-
     if remote {
-        // Drop from host OS. Forward to engine → client.
+        // ── Remote: drop EVERYTHING from the host OS, forward to client ──
         match event_type {
             CGEventType::MouseMoved => {
                 let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i16;
                 let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i16;
-                let _ = state.tx.try_send(InputEvent::MouseMove { dx, dy });
+                if dx != 0 || dy != 0 {
+                    let _ = state.tx.blocking_send(InputEvent::MouseMove { dx, dy });
+                }
             }
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
                 let btn = button_from_tap(event_type, event);
-                let _ = state.tx.try_send(InputEvent::MouseDown { button: btn });
+                let _ = state.tx.blocking_send(InputEvent::MouseDown { button: btn });
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp => {
                 let btn = button_from_tap(event_type, event);
-                let _ = state.tx.try_send(InputEvent::MouseUp { button: btn });
+                let _ = state.tx.blocking_send(InputEvent::MouseUp { button: btn });
             }
             CGEventType::ScrollWheel => {
                 let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
                 let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
-                let _ = state.tx.try_send(InputEvent::Scroll { dx: dx as i16, dy: dy as i16 });
+                let _ = state.tx.blocking_send(InputEvent::Scroll { dx: dx as i16, dy: dy as i16 });
             }
             CGEventType::KeyDown => {
                 let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                 let mods = extract_modifiers(event);
-                let _ = state.tx.try_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods });
+                let _ = state.tx.blocking_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods });
             }
             CGEventType::KeyUp => {
                 let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                 let mods = extract_modifiers(event);
-                let _ = state.tx.try_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods });
+                let _ = state.tx.blocking_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods });
             }
             CGEventType::FlagsChanged => {
-                // Modifier-only state change — forward as both down+up to keep things simple.
-                // The modifiers are extracted from the event flags.
+                // Modifier-only change — forward modifiers via a fake key event.
+                let mods = extract_modifiers(event);
+                let _ = state.tx.blocking_send(InputEvent::KeyDown { keycode: 0, modifiers: mods });
             }
             _ => {}
         }
-        return None; // drop from host OS when remote
+        return None; // DROP — host OS never sees this event
     }
 
-    // Local: pass the event through so macOS processes it normally.
-    // CGEvent's Clone does CFRetain — safe to return a retained copy.
-    Some(event.clone())
+    // ── Local: feed cursor position for edge detection, let OS process ──
+    if is_mouse_or_click(event_type) {
+        let loc = event.location();
+        let nx = (loc.x as f32 / state.screen_w).clamp(0.0, 1.0);
+        let ny = (loc.y as f32 / state.screen_h).clamp(0.0, 1.0);
+        let _ = state.tx.blocking_send(InputEvent::MouseMoveAbsolute { x: nx, y: ny });
+    }
+    Some(event.clone()) // pass-through to OS
 }
 
 pub struct MacOSInput {
@@ -174,7 +175,15 @@ impl PlatformInput for MacOSInput {
                 CGEventTapOptions::Default,
                 event_types,
                 move |proxy, etype, event| {
-                    tap_callback(proxy, etype, event, state_ref)
+                    // catch_unwind prevents a panic from crossing the FFI boundary
+                    // (UB). If the callback panics, drop the event.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tap_callback(proxy, etype, event, state_ref)
+                    }))
+                    .unwrap_or_else(|_| {
+                        log::error!("tap callback panicked — dropping event");
+                        None
+                    })
                 },
             ) {
                 Ok(t) => t,

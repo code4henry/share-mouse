@@ -2,6 +2,7 @@ pub mod protocol;
 pub mod network;
 pub mod screen;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -55,6 +56,9 @@ pub struct Engine {
     layout: Arc<Mutex<ScreenLayout>>,
     state: Arc<Mutex<EngineState>>,
     local_screen_id: String,
+    /// Cached screen size for the hot path in Remote-mode delta forwarding.
+    screen_w: std::sync::atomic::AtomicU32,
+    screen_h: std::sync::atomic::AtomicU32,
 }
 
 /// Normalized distance from the client's host-facing edge that returns the cursor.
@@ -72,6 +76,8 @@ impl Engine {
             layout: Arc::new(Mutex::new(ScreenLayout::new())),
             state: Arc::new(Mutex::new(EngineState::new())),
             local_screen_id,
+            screen_w: AtomicU32::new(1920),
+            screen_h: AtomicU32::new(1080),
         }
     }
 
@@ -202,6 +208,10 @@ impl Engine {
         {
             let p = self.platform.lock().await;
             p.show_cursor().ok();
+            if let Ok((w, h)) = p.get_screen_size() {
+                self.screen_w.store(w, Ordering::Relaxed);
+                self.screen_h.store(h, Ordering::Relaxed);
+            }
         }
         log::info!("Started as Host — CGEventTap capturing input");
 
@@ -408,14 +418,11 @@ impl Engine {
                 // mouse deltas, clicks, keys, and scroll. Forward all of them.
                 match event {
                     InputEvent::MouseMove { dx, dy } => {
-                        // Raw HID pixel deltas from the tap — normalize to host
-                        // screen size so the client can scale by its own.
-                        let (w, h) = {
-                            let p = self.platform.lock().await;
-                            p.get_screen_size().unwrap_or((1920, 1080))
-                        };
-                        let dx_n = *dx as f32 / (w as f32).max(1.0);
-                        let dy_n = *dy as f32 / (h as f32).max(1.0);
+                        // Raw HID pixel deltas — normalize to cached host size.
+                        let w = (self.screen_w.load(Ordering::Relaxed) as f32).max(1.0);
+                        let h = (self.screen_h.load(Ordering::Relaxed) as f32).max(1.0);
+                        let dx_n = *dx as f32 / w;
+                        let dy_n = *dy as f32 / h;
                         if dx_n.abs() > 0.0001 || dy_n.abs() > 0.0001 {
                             let _ = self.network.send_to(
                                 &peer_id,
@@ -459,6 +466,8 @@ impl Engine {
                 p.set_is_remote(false);
                 p.show_cursor().ok();
                 if let Ok((w, h)) = p.get_screen_size() {
+                    self.screen_w.store(w, Ordering::Relaxed);
+                    self.screen_h.store(h, Ordering::Relaxed);
                     p.warp_cursor((w as f32 * 0.75) as i32, (h / 2) as i32).ok();
                 }
                 log::info!("<- CursorLeave from {}, owner=Local, is_remote=false", from);
