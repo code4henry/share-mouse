@@ -8,7 +8,7 @@
 /// Injection: Uses CGEvent::new_mouse_event / CGEvent::new_keyboard_event + CGEventPost.
 /// Cursor: Uses CGWarpMouseCursorPosition, CGDisplayHideCursor/ShowCursor.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use core_foundation::runloop::kCFRunLoopCommonModes;
@@ -40,6 +40,13 @@ struct TapState {
     prev_modifiers: std::sync::atomic::AtomicU64,
     /// Dropped-event counter (logged periodically when non-zero).
     drops: std::sync::atomic::AtomicU64,
+    /// Pending mouse delta (coalesced when channel is full — avoids stutter).
+    pending_dx: std::sync::atomic::AtomicI32,
+    pending_dy: std::sync::atomic::AtomicI32,
+    /// true = engine running (forward events); false = stopped (teardown).
+    running: Arc<AtomicBool>,
+    /// Whether prev_modifiers has been seeded since entering Remote mode.
+    modifiers_seeded: std::sync::atomic::AtomicBool,
 }
 
 fn is_pos_event(et: u32) -> bool {
@@ -50,6 +57,21 @@ fn is_pos_event(et: u32) -> bool {
         | KCG_EVENT_OTHER_DOWN | KCG_EVENT_OTHER_UP
         | KCG_EVENT_LEFT_DRAGGED | KCG_EVENT_RIGHT_DRAGGED | KCG_EVENT_OTHER_DRAGGED
     )
+}
+
+/// Flush any coalesced pending mouse deltas from a previous overload. Must
+/// be called before sending a non-mouse event (click/key/scroll) so ordering
+/// is preserved.
+fn flush_pending(state: &TapState) {
+    let dx = state.pending_dx.swap(0, Ordering::Relaxed) as i16;
+    let dy = state.pending_dy.swap(0, Ordering::Relaxed) as i16;
+    if dx != 0 || dy != 0 {
+        // If this send also fails, we lose the pending delta — but the next
+        // mouse move will have fresh deltas anyway.
+        if state.tx.try_send(InputEvent::MouseMove { dx, dy }).is_err() {
+            state.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn btn_from_type(et: u32, _event: *mut std::ffi::c_void) -> MouseButton {
@@ -77,7 +99,12 @@ unsafe extern "C" fn raw_tap_callback(
             return event;
         }
         let state = &*(user_info as *const TapState);
-        tap_callback_impl(event_type, event, state)
+        // running=false → drop events (stop_capture tears down via CGEventTapEnable + CFRunLoopStop)
+        if state.running.load(Ordering::Relaxed) {
+            tap_callback_impl(event_type, event, state)
+        } else {
+            std::ptr::null_mut()
+        }
     }));
     match result {
         Ok(ptr) => ptr,
@@ -95,30 +122,54 @@ fn tap_callback_impl(
 
     if remote {
         // ── Remote: drop from host, forward to client ──
+        // On the first event after entering Remote mode, seed the modifier
+        // tracker so FlagsChanged doesn't emit spurious key events.
+        if !state.modifiers_seeded.swap(true, Ordering::Relaxed) {
+            let flags = unsafe { CGEventGetFlags(event) };
+            state.prev_modifiers.store(flags, Ordering::Relaxed);
+        }
         match event_type {
             KCG_EVENT_MOUSE_MOVED | KCG_EVENT_LEFT_DRAGGED
             | KCG_EVENT_RIGHT_DRAGGED | KCG_EVENT_OTHER_DRAGGED => {
                 let dx = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_DELTA_X) } as i16;
                 let dy = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_DELTA_Y) } as i16;
                 if dx != 0 || dy != 0 {
-                    if state.tx.try_send(InputEvent::MouseMove { dx, dy }).is_err() {
-                        state.drops.fetch_add(1, Ordering::Relaxed);
+                    // Accumulate pending deltas (from prior failed sends), clamp to i16.
+                    let pdx = state.pending_dx.swap(0, Ordering::Relaxed);
+                    let pdy = state.pending_dy.swap(0, Ordering::Relaxed);
+                    let tot: (i16, i16) = {
+                        let x = (dx as i32).saturating_add(pdx);
+                        let y = (dy as i32).saturating_add(pdy);
+                        (x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                         y.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+                    };
+                    if state.tx.try_send(InputEvent::MouseMove { dx: tot.0, dy: tot.1 }).is_err() {
+                        // Channel full — park the delta for next frame.
+                        state.pending_dx.fetch_add(tot.0 as i32, Ordering::Relaxed);
+                        state.pending_dy.fetch_add(tot.1 as i32, Ordering::Relaxed);
+                        let drops = state.drops.fetch_add(1, Ordering::Relaxed);
+                        if drops % 1000 == 999 {
+                            log::warn!("tap: {} events dropped (channel full)", drops + 1);
+                        }
                     }
                 }
             }
             KCG_EVENT_LEFT_DOWN | KCG_EVENT_RIGHT_DOWN | KCG_EVENT_OTHER_DOWN => {
+                flush_pending(state);
                 let btn = btn_from_type(event_type, event);
                 if state.tx.try_send(InputEvent::MouseDown { button: btn }).is_err() {
                     state.drops.fetch_add(1, Ordering::Relaxed);
                 }
             }
             KCG_EVENT_LEFT_UP | KCG_EVENT_RIGHT_UP | KCG_EVENT_OTHER_UP => {
+                flush_pending(state);
                 let btn = btn_from_type(event_type, event);
                 if state.tx.try_send(InputEvent::MouseUp { button: btn }).is_err() {
                     state.drops.fetch_add(1, Ordering::Relaxed);
                 }
             }
             KCG_EVENT_SCROLL_WHEEL => {
+                flush_pending(state);
                 let dy = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_SCROLL_AXIS_1) } as i16;
                 let dx = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_SCROLL_AXIS_2) } as i16;
                 if state.tx.try_send(InputEvent::Scroll { dx, dy }).is_err() {
@@ -126,6 +177,7 @@ fn tap_callback_impl(
                 }
             }
             KCG_EVENT_KEY_DOWN => {
+                flush_pending(state);
                 let kc = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_KEYCODE) } as u16;
                 let mods = raw_modifiers(unsafe { CGEventGetFlags(event) });
                 if state.tx.try_send(InputEvent::KeyDown { keycode: kc as u16, modifiers: mods }).is_err() {
@@ -133,6 +185,7 @@ fn tap_callback_impl(
                 }
             }
             KCG_EVENT_KEY_UP => {
+                flush_pending(state);
                 let kc = unsafe { CGEventGetIntegerValueField(event, KCG_FIELD_KEYCODE) } as u16;
                 let mods = raw_modifiers(unsafe { CGEventGetFlags(event) });
                 if state.tx.try_send(InputEvent::KeyUp { keycode: kc as u16, modifiers: mods }).is_err() {
@@ -140,6 +193,7 @@ fn tap_callback_impl(
                 }
             }
             KCG_EVENT_FLAGS_CHANGED => {
+                flush_pending(state);
                 let new_flags = unsafe { CGEventGetFlags(event) };
                 let prev = state.prev_modifiers.swap(new_flags, Ordering::Relaxed);
                 let delta = new_flags ^ prev;
@@ -178,6 +232,8 @@ fn tap_callback_impl(
     }
 
     // ── Local: feed cursor position for edge detection, pass through ──
+    // Reset modifier seeding so next Remote entry gets fresh state.
+    state.modifiers_seeded.store(false, Ordering::Relaxed);
     if is_pos_event(event_type) {
         let loc = unsafe { CGEventGetLocation(event) };
         let nx = (loc.x as f32 / state.screen_w).clamp(0.0, 1.0);
@@ -186,8 +242,8 @@ fn tap_callback_impl(
             state.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
-    // Pass through — retain and return (system will release original)
-    unsafe { CGEventCreateCopy(event) }
+    // Pass through — return the original event (standard CGEventTap pattern).
+    event
 }
 
 /// Read modifier flags from raw CGEventFlags into our Modifiers bitmask.
@@ -204,21 +260,38 @@ fn raw_modifiers(raw: u64) -> Modifiers {
 pub struct MacOSInput {
     /// Whether the engine has told the tap the cursor is on a remote screen.
     pub tap_is_remote: Arc<AtomicBool>,
+    /// Set when a tap is already running — prevents double-tap on host restart.
+    tap_running: Arc<AtomicBool>,
+    /// Raw CFMachPortRef for CGEventTapEnable(false) on stop.
+    tap_handle: std::sync::atomic::AtomicUsize,
+    /// Raw CFRunLoopRef — stored by the spawned thread, used by stop_capture
+    /// to wake the runloop even when idle.
+    runloop_handle: std::sync::atomic::AtomicUsize,
 }
 
 impl MacOSInput {
     pub fn new() -> Self {
         Self {
             tap_is_remote: Arc::new(AtomicBool::new(false)),
+            tap_running: Arc::new(AtomicBool::new(false)),
+            tap_handle: std::sync::atomic::AtomicUsize::new(0),
+            runloop_handle: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
 
 impl PlatformInput for MacOSInput {
     fn start_capture(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<InputEvent>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(2048);
+        // Prevent double-tap if the user restarts Host without stopping engine.
+        if self.tap_running.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("CGEventTap is already running — stop the engine first");
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
 
         let is_remote = self.tap_is_remote.clone();
+        let stop_flag = self.tap_running.clone();
+        let rl_handle_ptr = &self.runloop_handle as *const std::sync::atomic::AtomicUsize as usize;
 
         // Use CGDisplayBounds (logical points, Retina-safe) not pixels_wide()
         let bounds = unsafe { CGDisplayBounds(CGDisplay::main().id) };
@@ -233,13 +306,17 @@ impl PlatformInput for MacOSInput {
             screen_h,
             prev_modifiers: std::sync::atomic::AtomicU64::new(0),
             drops: std::sync::atomic::AtomicU64::new(0),
+            pending_dx: std::sync::atomic::AtomicI32::new(0),
+            pending_dy: std::sync::atomic::AtomicI32::new(0),
+            running: stop_flag.clone(),
+            modifiers_seeded: std::sync::atomic::AtomicBool::new(false),
         });
         let state_ptr = Box::into_raw(state) as *mut std::ffi::c_void;
         let state_ptr_addr = state_ptr as usize; // raw ptr → Send-safe integer
 
         let tap: *mut std::ffi::c_void = unsafe {
             CGEventTapCreate(
-                KCG_HID_EVENT_TAP,
+                KCG_SESSION_EVENT_TAP,
                 KCG_HEAD_INSERT_EVENT_TAP,
                 KCG_EVENT_TAP_OPTION_DEFAULT,
                 KCG_EVENT_MASK,
@@ -249,22 +326,25 @@ impl PlatformInput for MacOSInput {
         };
 
         if tap.is_null() {
+            self.tap_running.store(false, Ordering::SeqCst);
             unsafe { drop(Box::from_raw(state_ptr as *mut TapState)); }
             anyhow::bail!(
                 "CGEventTap failed — grant Accessibility + Input Monitoring in System Settings"
             );
         }
 
+        self.tap_handle.store(tap as usize, Ordering::SeqCst);
         let tap_addr = tap as usize; // Send-safe handle
 
         log::info!(
-            "Raw CGEventTap created (HID, active); logical screen {:.0}x{:.0}",
+            "Raw CGEventTap created (Session, active); logical screen {:.0}x{:.0}",
             screen_w, screen_h
         );
 
         std::thread::spawn(move || {
             let tap: *mut std::ffi::c_void = tap_addr as *mut std::ffi::c_void;
             let state_ptr = state_ptr_addr as *mut std::ffi::c_void;
+            let rl_ptr = rl_handle_ptr as *const std::sync::atomic::AtomicUsize;
             unsafe {
                 let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
                 if source.is_null() {
@@ -278,15 +358,19 @@ impl PlatformInput for MacOSInput {
                     kCFRunLoopCommonModes as *const std::ffi::c_void,
                 );
                 CGEventTapEnable(tap, true);
+                // Store runloop ref so stop_capture can wake us.
+                (*rl_ptr).store(CFRunLoopGetCurrent() as usize, Ordering::SeqCst);
                 log::info!("Raw CGEventTap thread running");
                 CFRunLoopRun();
 
-                // Log dropped events on exit
+                // After runloop stops, clean up.
+                CGEventTapEnable(tap, false);
                 let state = &*(state_ptr as *const TapState);
                 let d = state.drops.load(Ordering::Relaxed);
                 if d > 0 {
                     log::warn!("Tap exiting; {} events dropped due to channel full", d);
                 }
+                drop(Box::from_raw(state_ptr as *mut TapState));
             }
         });
 
@@ -294,9 +378,18 @@ impl PlatformInput for MacOSInput {
     }
 
     fn stop_capture(&self) -> anyhow::Result<()> {
-        // The CFRunLoop thread can't be stopped cleanly from outside —
-        // it lives until the process exits. This is acceptable for a
-        // system-tray-style app.
+        // Disable the tap immediately so it stops firing new callbacks.
+        let handle = self.tap_handle.swap(0, Ordering::SeqCst) as *mut std::ffi::c_void;
+        if !handle.is_null() {
+            unsafe { CGEventTapEnable(handle, false); }
+        }
+        // Wake the runloop so the thread exits (even if idle, no callbacks).
+        let rl = self.runloop_handle.swap(0, Ordering::SeqCst) as *mut std::ffi::c_void;
+        if !rl.is_null() {
+            unsafe { CFRunLoopStop(rl); }
+        }
+        // Tell the callback to drop events (stops forwarding).
+        self.tap_running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -404,8 +497,11 @@ impl PlatformInput for MacOSInput {
 
     fn warp_cursor(&self, x: i32, y: i32) -> anyhow::Result<()> {
         log::debug!("warp_cursor ({},{})", x, y);
-        unsafe {
-            CGWarpMouseCursorPosition(CGPoint::new(x as f64, y as f64));
+        let err = unsafe {
+            CGWarpMouseCursorPosition(CGPoint::new(x as f64, y as f64))
+        };
+        if err != 0 {
+            log::warn!("warp_cursor({x},{y}) failed: CGError {err}");
         }
         Ok(())
     }
@@ -415,12 +511,19 @@ impl PlatformInput for MacOSInput {
     }
 
     fn set_is_remote(&self, remote: bool) {
+        // When entering Remote mode, seed prev_modifiers from the current flags
+        // so the first FlagsChanged doesn't compare against a stale/zero value.
+        // We can't access TapState from here (no handle), so use a one-shot
+        // via the AtomicBool side-channel: the tap callback reads this flag on
+        // the next event and snapshots the modifier state.
         self.tap_is_remote.store(remote, Ordering::Relaxed);
     }
 
     fn get_screen_size(&self) -> anyhow::Result<(u32, u32)> {
-        let display = CGDisplay::main();
-        Ok((display.pixels_wide() as u32, display.pixels_high() as u32))
+        // Use logical points (CGDisplayBounds), not physical pixels.  The tap
+        // normalizes deltas against logical size; the engine must match.
+        let bounds = unsafe { CGDisplayBounds(CGDisplay::main().id) };
+        Ok((bounds.size.width as u32, bounds.size.height as u32))
     }
 
     fn get_cursor_pos(&self) -> anyhow::Result<(i32, i32)> {
@@ -492,15 +595,13 @@ extern "C" {
     );
     fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
     fn CFRunLoopRun();
+    fn CFRunLoopStop(rl: *mut std::ffi::c_void);
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
     // Event accessors on a raw CGEventRef
-    fn CGEventGetType(event: *mut std::ffi::c_void) -> u32;
     fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
     fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
-    fn CGEventCreateCopy(event: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     fn CGDisplayBounds(display: u32) -> core_graphics::geometry::CGRect;
-    fn CFRelease(cf: *mut std::ffi::c_void);
 }
 
 type RawTapCallback = unsafe extern "C" fn(
@@ -511,7 +612,7 @@ type RawTapCallback = unsafe extern "C" fn(
 ) -> *mut std::ffi::c_void;
 
 // CGEventTap constants (not exposed by the crate)
-const KCG_HID_EVENT_TAP: u32 = 0;
+const KCG_SESSION_EVENT_TAP: u32 = 1; // kCGSessionEventTap
 const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
