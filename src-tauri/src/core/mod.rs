@@ -402,21 +402,31 @@ impl Engine {
 
                         if let Some(peer_id_str) = neighbor_peer {
                             if let Ok(peer_id) = uuid::Uuid::parse_str(&peer_id_str) {
-                                // Tell the peer to take the cursor. If the send fails
-                                // (peer disconnected / channel full), stay Local — don't
-                                // enter a broken Remote state.
-                                if self.network.send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny }).await.is_err() {
+                                // Hide cursor, then flip the tap to Remote so the very
+                                // next event it sees is handled in remote mode (relative
+                                // deltas, dropped from the host OS).  Do this BEFORE the
+                                // async send to close the window where the tap still runs
+                                // in Local mode and leaks MouseMoveAbsolute events.
+                                {
+                                    let p = self.platform.lock().await;
+                                    p.hide_cursor().ok();
+                                    p.set_is_remote(true);
+                                }
+                                // Hand the cursor to the peer. On failure, roll fully
+                                // back to Local.
+                                if self.network
+                                    .send_to(&peer_id, InputEvent::CursorEnter { x: nx, y: ny })
+                                    .await
+                                    .is_err()
+                                {
                                     log::warn!("send CursorEnter to {} failed — staying Local", peer_id);
+                                    let p = self.platform.lock().await;
+                                    p.set_is_remote(false);
+                                    p.show_cursor().ok();
                                     return;
                                 }
                                 log::info!("-> CursorEnter to peer {} at ({:.3},{:.3})", peer_id, nx, ny);
-
-                                // Tell the tap to drop events from the host OS.
-                                {
-                                    let p = self.platform.lock().await;
-                                    p.set_is_remote(true);
-                                    p.hide_cursor().ok();
-                                }
+                                // Commit ownership.
                                 {
                                     let mut s = self.state.lock().await;
                                     s.cursor_owner = CursorOwner::Remote(peer_id);

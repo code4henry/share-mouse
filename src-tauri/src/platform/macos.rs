@@ -153,6 +153,17 @@ fn tap_callback_impl(
                         }
                     }
                 }
+                // Cursor is hidden in Remote mode — this instantaneous jump is
+                // invisible. Recentering keeps the physical Mac cursor off every
+                // edge, so macOS keeps emitting deltas in the pushed direction
+                // and the remote cursor never stalls. CGWarpMouseCursorPosition
+                // does NOT post a mouse event → no feedback loop.
+                unsafe {
+                    CGWarpMouseCursorPosition(CGPoint {
+                        x: state.screen_w as f64 / 2.0,
+                        y: state.screen_h as f64 / 2.0,
+                    });
+                }
             }
             KCG_EVENT_LEFT_DOWN | KCG_EVENT_RIGHT_DOWN | KCG_EVENT_OTHER_DOWN => {
                 flush_pending(state);
@@ -517,6 +528,11 @@ impl PlatformInput for MacOSInput {
         // via the AtomicBool side-channel: the tap callback reads this flag on
         // the next event and snapshots the modifier state.
         self.tap_is_remote.store(remote, Ordering::Relaxed);
+        if remote {
+            // Warp-on-every-move needs zero suppression, else macOS lags
+            // mouse events ~250 ms after each CGWarpMouseCursorPosition.
+            unsafe { CGSetLocalEventsSuppressionInterval(0.0); }
+        }
     }
 
     fn get_screen_size(&self) -> anyhow::Result<(u32, u32)> {
@@ -602,6 +618,7 @@ extern "C" {
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
     fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
     fn CGDisplayBounds(display: u32) -> core_graphics::geometry::CGRect;
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64);
 }
 
 type RawTapCallback = unsafe extern "C" fn(
