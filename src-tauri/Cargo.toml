@@ -1,6 +1,6 @@
 [package]
 name = "share-mouse"
-version = "0.2.1"
+version = "0.3.0"
 description = "Share mouse and keyboard across Mac and Windows"
 authors = ["ShareMouse"]
 license = "MIT"
