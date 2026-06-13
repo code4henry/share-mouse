@@ -10,18 +10,30 @@ permissions:
   contents: write
 
 jobs:
+  # Create the (draft) release first so parallel build jobs can upload to it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "ShareMouse ${{ github.ref_name }}" \
+            --notes "Cross-platform mouse & keyboard sharing app. See assets below." \
+            --draft \
+            || echo "release may already exist"
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            artifact: ShareMouse_aarch64.dmg
+            target: aarch64-apple-darwin
             name: macOS (Apple Silicon)
           - platform: windows-latest
-            args: ''
-            artifact: ShareMouse_0.1.0_x64-setup.exe
+            target: ''
             name: Windows (x64)
 
     runs-on: ${{ matrix.platform }}
@@ -37,7 +49,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -56,36 +68,49 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+      # ── macOS: build, re-sign with a clean ad-hoc signature, rebuild dmg ──
+      - name: Build Tauri app (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: npm run tauri build -- --target aarch64-apple-darwin
+
+      - name: Re-sign and repackage dmg (macOS)
+        if: matrix.platform == 'macos-latest'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'ShareMouse ${{ github.ref_name }}'
-          releaseBody: |
-            Cross-platform mouse & keyboard sharing app — share one mouse & keyboard between macOS and Windows.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/ShareMouse.app"
+          VERSION="${{ github.ref_name }}"
 
-            ## 📦 Downloads
-            - **macOS** (Apple Silicon): `ShareMouse_*_aarch64.dmg`
-            - **Windows** (x64): `ShareMouse_*_x64-setup.exe` or `.msi`
+          # Re-sign the whole bundle with a clean ad-hoc signature.
+          # Tauri's default ad-hoc signature is inconsistent ("code has no
+          # resources but signature indicates they must be present"), which
+          # makes macOS report the app as "damaged". Re-signing fixes it.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
 
-            ## 🚀 Usage
-            1. Install on both Mac and Windows (same WiFi network)
-            2. On the machine with the physical mouse/keyboard → click **Host**
-            3. On the other machine → enter Host's `IP:24800` → click **Connect**
-            4. Move cursor to screen edge to switch machines!
+          # Build a fresh drag-to-Applications dmg from the re-signed app.
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          mkdir -p "$STAGING"
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          DMG="ShareMouse_${VERSION}_aarch64.dmg"
+          hdiutil create -volname ShareMouse -srcfolder "$STAGING" -ov -format UDZO "$DMG"
 
-            ## ⚠️ macOS — "文件已损坏" fix
-            The app is unsigned, so macOS shows "damaged". Fix in Terminal:
-            ```bash
-            xattr -cr ~/Downloads/ShareMouse_*.dmg
-            # drag to Applications, then:
-            xattr -cr /Applications/ShareMouse.app
-            ```
-            Then grant Accessibility: **系统设置 → 隐私与安全性 → 辅助功能 → ShareMouse**
+          gh release upload "$VERSION" "$DMG" --clobber
 
-            **Windows** users: just run the `.exe` installer, no extra config needed.
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+      # ── Windows: standard build, upload exe + msi ──
+      - name: Build Tauri app (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: npm run tauri build
+
+      - name: Upload Windows assets
+        if: matrix.platform == 'windows-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ github.ref_name }}"
+          gh release upload $version `
+            (Get-Item src-tauri/target/release/bundle/nsis/*.exe) `
+            (Get-Item src-tauri/target/release/bundle/msi/*.msi) `
+            --clobber
