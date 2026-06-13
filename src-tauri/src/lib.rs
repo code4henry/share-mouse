@@ -21,55 +21,60 @@ pub fn run() {
     let local_screen_id = format!("local-{}", uuid::Uuid::new_v4());
     let engine = Arc::new(Engine::new(platform_input, network_hub.clone(), local_screen_id));
 
-    // Spawn the persistent network handler (consumes incoming events, injects them)
-    engine.spawn_network_handler();
+    // ── Dedicated background thread ──────────────────────
+    // tauri::async_runtime may throttle when the window is minimized.
+    // Run all keyboard/mouse forwarding on an independent thread+tokio
+    // runtime so input injection survives window minimize/restore cycles.
+    let bg_engine = engine.clone();
+    let bg_network = network_hub.clone();
+    let auto_host = std::env::var("SHAREMOUSE_AUTO_HOST").ok();
+    let auto_client = std::env::var("SHAREMOUSE_AUTO_CLIENT").ok();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bg tokio runtime");
+        rt.block_on(async move {
+            // Persistent network-handler task.
+            bg_engine.spawn_network_handler();
+
+            // Auto-start Host
+            if auto_host.is_some() {
+                log::info!("SHAREMOUSE_AUTO_HOST set — auto-starting host");
+                let n = bg_network.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = n.start_server(24800).await {
+                        log::error!("Server error: {}", e);
+                    }
+                });
+                if let Err(e) = bg_engine.clone().start_host().await {
+                    log::error!("start_host error: {}", e);
+                }
+            }
+
+            // Auto-connect as Client
+            if let Some(addr) = auto_client {
+                log::info!("SHAREMOUSE_AUTO_CLIENT={} — auto-connecting as client", addr);
+                match bg_network.connect_to(&addr).await {
+                    Ok(peer_id) => {
+                        log::info!("Connected to {} (peer: {})", addr, peer_id);
+                        if let Err(e) = bg_engine.clone().start_client().await {
+                            log::error!("start_client error: {}", e);
+                        } else {
+                            log::info!("Client mode active");
+                        }
+                    }
+                    Err(e) => log::error!("Failed to connect to {}: {}", addr, e),
+                }
+            }
+
+            // Hold the runtime open (idle, waiting on spawned tasks).
+            std::future::pending::<()>().await;
+        });
+    });
 
     tauri::Builder::default()
-        .setup({
-            let engine = engine.clone();
-            let network = network_hub.clone();
-            move |_app| {
-                // Test/dev affordance: auto-start Host mode without UI.
-                if std::env::var("SHAREMOUSE_AUTO_HOST").is_ok() {
-                    log::info!("SHAREMOUSE_AUTO_HOST set — auto-starting host");
-                    let engine = engine.clone();
-                    let network = network.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let n = network.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = n.start_server(24800).await {
-                                log::error!("Server error: {}", e);
-                            }
-                        });
-                        if let Err(e) = engine.clone().start_host().await {
-                            log::error!("start_host error: {}", e);
-                        }
-                        let granted = engine.check_permission_simple().await;
-                        log::info!("Accessibility permission: {}", if granted { "GRANTED" } else { "MISSING" });
-                    });
-                }
-                // Auto-connect as Client to a given IP:port.
-                if let Ok(addr) = std::env::var("SHAREMOUSE_AUTO_CLIENT") {
-                    log::info!("SHAREMOUSE_AUTO_CLIENT={} — auto-connecting as client", addr);
-                    let engine = engine.clone();
-                    let network = network.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match network.connect_to(&addr).await {
-                            Ok(peer_id) => {
-                                log::info!("Connected to {} (peer: {})", addr, peer_id);
-                                if let Err(e) = engine.clone().start_client().await {
-                                    log::error!("start_client error: {}", e);
-                                } else {
-                                    log::info!("Client mode active");
-                                }
-                            }
-                            Err(e) => log::error!("Failed to connect to {}: {}", addr, e),
-                        }
-                    });
-                }
-                Ok(())
-            }
-        })
         .plugin(
             tauri_plugin_log::Builder::default()
                 .targets([

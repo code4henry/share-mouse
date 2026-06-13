@@ -86,7 +86,7 @@ impl Engine {
     pub fn spawn_network_handler(self: &Arc<Self>) {
         let mut rx = self.network.subscribe();
         let engine = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             log::info!("Network handler task started");
             loop {
                 match rx.recv().await {
@@ -227,7 +227,7 @@ impl Engine {
         log::info!("Started as Host — CGEventTap capturing input");
 
         let engine = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             while let Some(event) = capture_rx.recv().await {
                 engine.handle_captured_event(&event).await;
             }
@@ -249,7 +249,7 @@ impl Engine {
 
         // Start the client cursor monitor (detects when to return the cursor).
         let engine = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             engine.client_monitor_loop().await;
         });
         log::info!("Started as Client — waiting for remote input");
